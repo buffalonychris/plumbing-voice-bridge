@@ -97,6 +97,9 @@ wsServer.on('connection', (twilioSocket, req) => {
   let openAiSocket;
   let openAiReady = false;
   let agentSpeaking = false;
+  let twilioStreamStarted = false;
+  let sessionUpdateSent = false;
+  let initialResponseCreateSent = false;
 
   const setAgentSpeaking = (nextState, reason) => {
     if (agentSpeaking === nextState) {
@@ -127,6 +130,20 @@ wsServer.on('connection', (twilioSocket, req) => {
   const initializeOpenAi = () => {
     openAiSocket = createOpenAiSocket();
 
+    const maybeSendInitialResponseCreate = () => {
+      if (initialResponseCreateSent || !twilioStreamStarted || !sessionUpdateSent) {
+        return;
+      }
+
+      if (!openAiSocket || openAiSocket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      openAiSocket.send(JSON.stringify({ type: 'response.create' }));
+      initialResponseCreateSent = true;
+      console.info('[openai] response.create sent', { callSid, streamSid });
+    };
+
     openAiSocket.on('open', () => {
       openAiReady = true;
       logState('Connected to OpenAI Realtime.', { callSid, streamSid, model: OPENAI_REALTIME_MODEL });
@@ -146,13 +163,8 @@ wsServer.on('connection', (twilioSocket, req) => {
       };
 
       openAiSocket.send(JSON.stringify(sessionUpdate));
-      openAiSocket.send(JSON.stringify({
-        type: 'response.create',
-        response: {
-          modalities: ['audio', 'text'],
-          instructions: `Greet the caller as ${OPERATOR_COMPANY_NAME} and ask how you can help with their plumbing issue today.`
-        }
-      }));
+      sessionUpdateSent = true;
+      maybeSendInitialResponseCreate();
     });
 
     openAiSocket.on('message', (raw) => {
@@ -228,7 +240,14 @@ wsServer.on('connection', (twilioSocket, req) => {
     if (msg.event === 'start') {
       callSid = msg.start?.callSid || callSid;
       streamSid = msg.start?.streamSid || streamSid;
+      twilioStreamStarted = true;
       logState('Twilio stream started.', { callSid, streamSid });
+
+      if (openAiReady && sessionUpdateSent && !initialResponseCreateSent && openAiSocket?.readyState === WebSocket.OPEN) {
+        openAiSocket.send(JSON.stringify({ type: 'response.create' }));
+        initialResponseCreateSent = true;
+        console.info('[openai] response.create sent', { callSid, streamSid });
+      }
       return;
     }
 
