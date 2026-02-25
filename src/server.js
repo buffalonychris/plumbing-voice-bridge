@@ -96,7 +96,21 @@ wsServer.on('connection', (twilioSocket, req) => {
   let streamSid = 'unknown-stream';
   let openAiSocket;
   let openAiReady = false;
-  let aiResponding = false;
+  let agentSpeaking = false;
+
+  const setAgentSpeaking = (nextState, reason) => {
+    if (agentSpeaking === nextState) {
+      return;
+    }
+
+    agentSpeaking = nextState;
+    logState('agentSpeaking transition.', {
+      callSid,
+      streamSid,
+      agentSpeaking,
+      reason
+    });
+  };
 
   logState('Twilio stream connected.', { remoteAddress });
 
@@ -147,15 +161,12 @@ wsServer.on('connection', (twilioSocket, req) => {
         return;
       }
 
-      if (msg.type === 'response.created') {
-        aiResponding = true;
-      }
-
-      if (msg.type === 'response.done') {
-        aiResponding = false;
+      if (msg.type === 'response.done' || msg.type === 'response.completed') {
+        setAgentSpeaking(false, msg.type);
       }
 
       if (msg.type === 'response.audio.delta' && msg.delta && twilioSocket.readyState === WebSocket.OPEN) {
+        setAgentSpeaking(true, msg.type);
         const media = {
           event: 'media',
           streamSid,
@@ -167,6 +178,18 @@ wsServer.on('connection', (twilioSocket, req) => {
       }
 
       if (msg.type === 'error') {
+        const openAiErrorCode = msg.error?.code;
+
+        if (openAiErrorCode === 'response_cancel_not_active') {
+          logState('Ignoring non-fatal OpenAI cancel error.', {
+            callSid,
+            streamSid,
+            code: openAiErrorCode,
+            error: msg.error
+          });
+          return;
+        }
+
         console.error('[stream] OpenAI Realtime error.', {
           callSid,
           streamSid,
@@ -214,11 +237,16 @@ wsServer.on('connection', (twilioSocket, req) => {
         return;
       }
 
-      if (aiResponding) {
+      if (agentSpeaking) {
         openAiSocket.send(JSON.stringify({ type: 'response.cancel' }));
         twilioSocket.send(JSON.stringify({ event: 'clear', streamSid }));
-        aiResponding = false;
-        logState('Caller interrupted agent speech.', { callSid, streamSid });
+        setAgentSpeaking(false, 'caller_interrupt');
+        logState('Caller interrupted agent speech. Sent cancel/clear.', { callSid, streamSid });
+      } else {
+        logState('Caller media received while agent not speaking. Skipping cancel/clear.', {
+          callSid,
+          streamSid
+        });
       }
 
       openAiSocket.send(JSON.stringify({
