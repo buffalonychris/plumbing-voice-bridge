@@ -117,6 +117,8 @@ fly logs
 
 Look for stream lifecycle logs including `callSid`, `streamSid`, and connection state transitions.
 
+- **Non-fatal cancel race (`response_cancel_not_active`)**: During caller interruptions, OpenAI Realtime can occasionally return `error.code="response_cancel_not_active"` if a cancel arrives after speech has already ended. The bridge now treats this as non-fatal, logs it, and keeps both sockets open. Interruption cancel/clear is now idempotent: it is only sent while `agentSpeaking=true`, and skipped when the agent is already silent.
+
 ## Notes on audio format
 
 Twilio Media Streams sends 8k μ-law (`g711_ulaw`) audio payloads. This bridge configures OpenAI Realtime session input and output audio format as `g711_ulaw`, so no explicit transcoding pipeline is required in Phase 1.
