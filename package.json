@@ -1,0 +1,19 @@
+{
+  "name": "plumbing-voice-bridge",
+  "version": "1.0.0",
+  "description": "Twilio Media Streams to OpenAI Realtime voice bridge",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  }
+}
