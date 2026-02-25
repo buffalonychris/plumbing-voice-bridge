@@ -1,0 +1,122 @@
+# Plumbing Voice Bridge (Twilio Media Streams ↔ OpenAI Realtime)
+
+Minimal production-grade voice bridge service for Phase 1 validation of a plumbing missed-call AI operator.
+
+## What this service does
+
+- Exposes `POST /twilio/voice` for Twilio Voice webhooks and returns TwiML.
+- Exposes `WS /twilio/stream` for Twilio Media Streams.
+- Opens a second WebSocket to OpenAI Realtime and relays audio both directions.
+- Exposes `GET /health` for health checks.
+
+## Endpoints
+
+1. `POST /twilio/voice`
+2. `WS /twilio/stream`
+3. `GET /health`
+
+## Environment variables
+
+Copy `.env.example` to `.env` and fill values:
+
+- `OPENAI_API_KEY` (required)
+- `OPENAI_REALTIME_MODEL` (default: `gpt-4o-realtime-preview-2024-12-17`)
+- `OPENAI_VOICE` (default: `alloy`)
+- `OPERATOR_COMPANY_NAME` (default: `Call Operator Pro Plumbing`)
+- `OPERATOR_SYSTEM_PROMPT` (optional override; defaults to `prompts/plumbing_operator_system_prompt.txt`)
+- `PORT` (default: `8080`)
+
+## Local run
+
+```bash
+npm install
+npm start
+```
+
+Service binds to `0.0.0.0:${PORT:-8080}`.
+
+### Minimal local checks
+
+Health check:
+
+```bash
+curl -i http://localhost:8080/health
+```
+
+Twilio webhook check:
+
+```bash
+curl -i -X POST http://localhost:8080/twilio/voice \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data 'CallSid=CA1234567890'
+```
+
+Expected: XML TwiML including `<Start><Stream url="wss://.../twilio/stream"/></Start>`.
+
+### WebSocket testing note
+
+`/twilio/stream` is driven by Twilio Media Streams during live calls. Local manual WS tests are optional and intentionally minimal in this Phase 1 bridge.
+
+## Twilio setup
+
+In Twilio Console:
+
+1. Go to **Phone Numbers** → **Manage** → **Active numbers**.
+2. Select your number.
+3. In **Voice & Fax** under **A call comes in**:
+   - Choose **Webhook**
+   - Method: **HTTP POST**
+   - URL: `https://<your-app>.fly.dev/twilio/voice`
+
+## Fly.io deployment
+
+### 1) Launch app (first time)
+
+```bash
+fly launch --no-deploy
+```
+
+If prompted, keep internal port as `8080`.
+
+### 2) Set secret
+
+```bash
+fly secrets set OPENAI_API_KEY=your_real_key_here
+```
+
+(Optional) set other vars:
+
+```bash
+fly secrets set OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview-2024-12-17
+fly secrets set OPENAI_VOICE=alloy
+fly secrets set OPERATOR_COMPANY_NAME='Call Operator Pro Plumbing'
+```
+
+### 3) Deploy
+
+```bash
+fly deploy
+```
+
+### 4) Configure Twilio webhook URL
+
+Use:
+
+```text
+https://<app>.fly.dev/twilio/voice
+```
+
+## Troubleshooting logs
+
+- **Twilio logs**: Twilio Console → **Monitor** → **Logs** → **Calls** (inspect webhook errors and call events).
+- **Fly logs**:
+
+```bash
+fly logs
+```
+
+Look for stream lifecycle logs including `callSid`, `streamSid`, and connection state transitions.
+
+## Notes on audio format
+
+Twilio Media Streams sends 8k μ-law (`g711_ulaw`) audio payloads. This bridge configures OpenAI Realtime session input and output audio format as `g711_ulaw`, so no explicit transcoding pipeline is required in Phase 1.
