@@ -2,7 +2,7 @@ const fs = require('fs');
 const http = require('http');
 const express = require('express');
 const WebSocket = require('ws');
-const { validateEnv } = require('./config/env');
+const { validateEnv, validateHubspotEnv, isHubspotEnabled } = require('./config/env');
 const {
   DEFAULT_PORT,
   DEFAULT_OPENAI_REALTIME_MODEL,
@@ -14,12 +14,26 @@ const logger = require('./monitoring/logger');
 const {
   createSession,
   getSession,
+  updateSession,
   touchSession,
   endSession,
   startSessionJanitor
 } = require('./runtime/sessionStore');
 const { transition } = require('./runtime/stateMachine');
+const {
+  upsertContact,
+  createDeal,
+  associateDealToContact,
+  logEngagement
+} = require('./integrations/hubspotClient');
 require('dotenv').config();
+
+try {
+  validateHubspotEnv();
+} catch (envError) {
+  logger.error('[startup] HubSpot configuration invalid.', { error: envError.message });
+  process.exit(1);
+}
 
 const PORT = Number(process.env.PORT || DEFAULT_PORT);
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || DEFAULT_OPENAI_REALTIME_MODEL;
@@ -99,6 +113,45 @@ function createOpenAiSocket() {
 
 function logState(message, state = {}) {
   logger.info(`[stream] ${message}`, state);
+}
+
+async function runHubspotIntake({ callSid, streamSid, callerPhone }) {
+  if (!isHubspotEnabled()) {
+    return { crmReady: false, reason: 'hubspot_disabled' };
+  }
+
+  if (!callerPhone) {
+    return { crmReady: false, reason: 'missing_phone' };
+  }
+
+  try {
+    const { id: contactId } = await upsertContact({ phone: callerPhone });
+    const { id: dealId } = await createDeal({ contactId, callSid });
+    await associateDealToContact(dealId, contactId);
+    await logEngagement(dealId, contactId, { callSid });
+
+    return {
+      crmReady: true,
+      contactId,
+      dealId
+    };
+  } catch (error) {
+    logger.error('[hubspot] Intake failed on stream start.', {
+      callSid,
+      streamSid,
+      status: error.status,
+      errorCode: error.code,
+      message: error.message,
+      details: error.details
+    });
+
+    return {
+      crmReady: false,
+      reason: 'hubspot_error',
+      errorCode: error.code || 'hubspot_error',
+      message: error.message
+    };
+  }
 }
 
 wsServer.on('connection', (twilioSocket, req) => {
@@ -293,6 +346,26 @@ wsServer.on('connection', (twilioSocket, req) => {
       const callerPhone = msg.start?.customParameters?.From || msg.start?.from;
       const session = createSession(callSid, streamSid, callerPhone);
       transition(session, 'CALL_STARTED', 'twilio_stream_start');
+
+      runHubspotIntake({ callSid, streamSid, callerPhone })
+        .then((hubspot) => {
+          updateSession(callSid, { hubspot });
+        })
+        .catch((error) => {
+          logger.error('[hubspot] Unexpected intake failure.', {
+            callSid,
+            streamSid,
+            error: error.message
+          });
+          updateSession(callSid, {
+            hubspot: {
+              crmReady: false,
+              reason: 'hubspot_error',
+              errorCode: error.code || 'hubspot_error',
+              message: error.message
+            }
+          });
+        });
 
       if (openAiReady && sessionUpdateSent && !initialResponseCreateSent && openAiSocket?.readyState === WebSocket.OPEN) {
         openAiSocket.send(JSON.stringify({ type: 'response.create' }));
