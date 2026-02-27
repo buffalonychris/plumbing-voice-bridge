@@ -14,6 +14,7 @@ const {
 const logger = require('./monitoring/logger');
 const { alertCritical, ALERT_EVENT_TYPES } = require('./monitoring/alerting');
 const { initIdempotency } = require('./governance/idempotencyStore');
+const { classifyDeploymentStatus, isTesterCaller, normalizeE164 } = require('./governance/deploymentGate');
 const {
   createSession,
   getSession,
@@ -77,6 +78,69 @@ function loadSystemPrompt() {
 const SYSTEM_PROMPT = loadSystemPrompt();
 
 const app = express();
+
+const UNAVAILABLE_TWIML = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Thanks for calling. Service is temporarily unavailable for this line. Please contact support.</Say>
+  <Hangup />
+</Response>`;
+
+async function evaluateDeploymentAccess({ callSid, callerPhone }) {
+  if (!isHubspotEnabled()) {
+    return {
+      allowed: true,
+      status: null,
+      classification: 'hubspot_disabled',
+      isTester: false,
+      reason: 'hubspot_disabled'
+    };
+  }
+
+  const companyId = process.env.HUBSPOT_COMPANY_ID;
+  const company = await getCompanyById(companyId);
+  const deploymentStatus = company?.properties?.deployment_status || null;
+  const classification = classifyDeploymentStatus(deploymentStatus);
+  const normalizedCaller = normalizeE164(callerPhone);
+  const isTester = isTesterCaller(normalizedCaller);
+
+  if (classification === 'open') {
+    return {
+      allowed: true,
+      status: deploymentStatus,
+      classification,
+      isTester,
+      reason: 'status_live'
+    };
+  }
+
+  if (classification === 'test_only') {
+    return {
+      allowed: isTester,
+      status: deploymentStatus,
+      classification,
+      isTester,
+      reason: isTester ? 'status_test_only_tester' : 'status_test_only_non_tester'
+    };
+  }
+
+  if (classification === 'blocked') {
+    return {
+      allowed: false,
+      status: deploymentStatus,
+      classification,
+      isTester,
+      reason: 'status_blocked'
+    };
+  }
+
+  return {
+    allowed: true,
+    status: deploymentStatus,
+    classification,
+    isTester,
+    reason: 'status_unknown_allow'
+  };
+}
 
 function parseStripeSignature(signatureHeader) {
   const parts = String(signatureHeader || '').split(',');
@@ -184,7 +248,7 @@ app.post('/internal/tools/:callSid', async (req, res) => {
   return res.status(result.ok ? 200 : 400).json(result);
 });
 
-app.post('/twilio/voice', (req, res) => {
+app.post('/twilio/voice', async (req, res) => {
   try {
     validateEnv();
   } catch (envError) {
@@ -193,8 +257,35 @@ app.post('/twilio/voice', (req, res) => {
   }
 
   const callSid = req.body.CallSid || 'unknown-call';
+  const callerPhone = req.body.From || null;
   const host = req.get('x-forwarded-host') || req.get('host');
   const streamUrl = `wss://${host}/twilio/stream`;
+
+  try {
+    const deploymentDecision = await evaluateDeploymentAccess({ callSid, callerPhone });
+    logger.info('[twilio/voice] Deployment gate decision.', {
+      callSid,
+      callerPhone: normalizeE164(callerPhone),
+      deploymentStatus: deploymentDecision.status,
+      classification: deploymentDecision.classification,
+      isTester: deploymentDecision.isTester,
+      allowed: deploymentDecision.allowed,
+      reason: deploymentDecision.reason
+    });
+
+    if (!deploymentDecision.allowed) {
+      return res.status(200).type('text/xml').send(UNAVAILABLE_TWIML);
+    }
+  } catch (error) {
+    logger.error('[twilio/voice] Deployment gate check failed.', {
+      callSid,
+      callerPhone: normalizeE164(callerPhone),
+      message: error.message,
+      code: error.code,
+      status: error.status
+    });
+    return res.status(200).type('text/xml').send(UNAVAILABLE_TWIML);
+  }
 
   logger.info('[twilio/voice] Building TwiML response.', { callSid, streamUrl });
 
@@ -522,8 +613,6 @@ wsServer.on('connection', (twilioSocket, req) => {
     });
   };
 
-  initializeOpenAi();
-
   twilioSocket.on('message', (raw) => {
     const msg = safeJsonParse(raw);
     if (!msg) {
@@ -544,38 +633,93 @@ wsServer.on('connection', (twilioSocket, req) => {
       const session = createSession(callSid, streamSid, callerPhone);
       transition(session, 'CALL_STARTED', 'twilio_stream_start');
 
-      runHubspotIntake({ callSid, streamSid, callerPhone })
-        .then((hubspot) => {
-          updateSession(callSid, { hubspot });
-        })
-        .catch(async (error) => {
-          logger.error('[hubspot] Unexpected intake failure.', {
-            callSid,
-            streamSid,
-            error: error.message
-          });
-          await alertCritical(ALERT_EVENT_TYPES.HUBSPOT_WRITE_FAILURE, {
-            callSid,
-            streamSid,
-            source: 'server.twilioSocket.start',
-            message: error.message,
-            errorCode: error.code || 'hubspot_intake_unexpected'
-          });
+      evaluateDeploymentAccess({ callSid, callerPhone })
+        .then((deploymentDecision) => {
           updateSession(callSid, {
-            hubspot: {
-              crmReady: false,
-              reason: 'hubspot_error',
-              errorCode: error.code || 'hubspot_error',
-              message: error.message
+            deploymentStatus: deploymentDecision.status,
+            deploymentGate: {
+              classification: deploymentDecision.classification,
+              isTester: deploymentDecision.isTester,
+              allowed: deploymentDecision.allowed,
+              reason: deploymentDecision.reason
             }
           });
-        });
 
-      if (openAiReady && sessionUpdateSent && !initialResponseCreateSent && openAiSocket?.readyState === WebSocket.OPEN) {
-        openAiSocket.send(JSON.stringify({ type: 'response.create' }));
-        initialResponseCreateSent = true;
-        logger.info('[openai] response.create sent', { callSid, streamSid });
-      }
+          logger.info('[stream] Deployment gate decision.', {
+            callSid,
+            streamSid,
+            callerPhone: normalizeE164(callerPhone),
+            deploymentStatus: deploymentDecision.status,
+            classification: deploymentDecision.classification,
+            isTester: deploymentDecision.isTester,
+            allowed: deploymentDecision.allowed,
+            reason: deploymentDecision.reason
+          });
+
+          if (!deploymentDecision.allowed) {
+            finalizeCall('deployment_gate_blocked');
+            closeBoth('deployment_gate_blocked');
+            return;
+          }
+
+          if (!openAiSocket) {
+            initializeOpenAi();
+          }
+
+          runHubspotIntake({ callSid, streamSid, callerPhone })
+            .then((hubspot) => {
+              updateSession(callSid, { hubspot });
+            })
+            .catch(async (error) => {
+              logger.error('[hubspot] Unexpected intake failure.', {
+                callSid,
+                streamSid,
+                error: error.message
+              });
+              await alertCritical(ALERT_EVENT_TYPES.HUBSPOT_WRITE_FAILURE, {
+                callSid,
+                streamSid,
+                source: 'server.twilioSocket.start',
+                message: error.message,
+                errorCode: error.code || 'hubspot_intake_unexpected'
+              });
+              updateSession(callSid, {
+                hubspot: {
+                  crmReady: false,
+                  reason: 'hubspot_error',
+                  errorCode: error.code || 'hubspot_error',
+                  message: error.message
+                }
+              });
+            });
+
+          if (openAiReady && sessionUpdateSent && !initialResponseCreateSent && openAiSocket?.readyState === WebSocket.OPEN) {
+            openAiSocket.send(JSON.stringify({ type: 'response.create' }));
+            initialResponseCreateSent = true;
+            logger.info('[openai] response.create sent', { callSid, streamSid });
+          }
+        })
+        .catch((error) => {
+          logger.error('[stream] Deployment gate check failed.', {
+            callSid,
+            streamSid,
+            callerPhone: normalizeE164(callerPhone),
+            message: error.message,
+            code: error.code,
+            status: error.status
+          });
+          updateSession(callSid, {
+            deploymentStatus: null,
+            deploymentGate: {
+              classification: 'error',
+              isTester: isTesterCaller(normalizeE164(callerPhone)),
+              allowed: false,
+              reason: 'deployment_gate_error'
+            }
+          });
+          finalizeCall('deployment_gate_error');
+          closeBoth('deployment_gate_error');
+        });
       return;
     }
 
