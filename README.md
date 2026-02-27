@@ -27,8 +27,21 @@ Copy `.env.example` to `.env` and fill values:
 - `SESSION_TTL_MINUTES` (default: `30`)
 - `HUBSPOT_ENABLED` (default: `false`; set to `true` to enable CRM intake on Twilio stream start)
 - `HUBSPOT_ACCESS_TOKEN` (required only when `HUBSPOT_ENABLED=true`)
+- `IDP_ENABLED` (default: `true`; in non-production you can set `false` to bypass idempotency with a warning log)
+- `IDP_DB_PATH` (default local: `./.data/idempotency.sqlite`; Fly recommended: `/data/idempotency.sqlite`)
 - `PORT` (default: `8080`)
 
+
+
+### Idempotency persistence (SQLite)
+
+HubSpot write operations are protected by a persistent idempotency layer using Node's built-in `node:sqlite` module (no extra npm dependency added). The idempotency key format is:
+
+```text
+{tenant}:{callSid}:{operation}:{stableHashOfInputs}
+```
+
+For Phase 1, `tenant` is fixed to `single` and idempotency is enabled by default.
 
 ## Local proxy requirements
 
@@ -53,6 +66,14 @@ Manual test:
 
 1. Start service with `HUBSPOT_ENABLED=false`; place a call and confirm Twilio ↔ OpenAI relay still works.
 2. Restart with `HUBSPOT_ENABLED=true` plus valid `HUBSPOT_ACCESS_TOKEN`; place a call and observe HubSpot intake logs on stream start.
+
+
+### Local idempotency smoke test
+
+1. Start the service with `HUBSPOT_ENABLED=true`, valid `HUBSPOT_ACCESS_TOKEN`, and `IDP_DB_PATH=./.data/idempotency.sqlite`.
+2. Trigger the same intake flow twice using the same `callSid` payload through the stream-start path.
+3. Confirm logs show `idempotency_set` on first write and `idempotency_hit` on replay.
+4. Verify no duplicate deal creation occurs in HubSpot for the replayed call.
 
 ### Minimal local checks
 
@@ -124,6 +145,17 @@ Use:
 ```text
 https://<app>.fly.dev/twilio/voice
 ```
+
+
+### Fly.io volume note for idempotency DB
+
+Mount a Fly volume at `/data` and set:
+
+```bash
+fly secrets set IDP_DB_PATH=/data/idempotency.sqlite
+```
+
+This keeps idempotency records durable across restarts and deploys.
 
 ## Troubleshooting logs
 

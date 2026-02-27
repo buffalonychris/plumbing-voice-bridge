@@ -11,6 +11,7 @@ const {
   DEFAULT_PROMPT_PATH
 } = require('./config/constants');
 const logger = require('./monitoring/logger');
+const { initIdempotency } = require('./governance/idempotencyStore');
 const {
   createSession,
   getSession,
@@ -39,6 +40,8 @@ const PORT = Number(process.env.PORT || DEFAULT_PORT);
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || DEFAULT_OPENAI_REALTIME_MODEL;
 const OPENAI_VOICE = process.env.OPENAI_VOICE || DEFAULT_OPENAI_VOICE;
 const OPERATOR_COMPANY_NAME = process.env.OPERATOR_COMPANY_NAME || DEFAULT_OPERATOR_COMPANY_NAME;
+const IDP_ENABLED = String(process.env.IDP_ENABLED || 'true').trim().toLowerCase() === 'true';
+const IDP_DB_PATH = process.env.IDP_DB_PATH || './.data/idempotency.sqlite';
 
 function loadSystemPrompt() {
   if (process.env.OPERATOR_SYSTEM_PROMPT && process.env.OPERATOR_SYSTEM_PROMPT.trim()) {
@@ -115,6 +118,20 @@ function logState(message, state = {}) {
   logger.info(`[stream] ${message}`, state);
 }
 
+async function initializeIdempotency() {
+  if (!IDP_ENABLED) {
+    if (process.env.NODE_ENV !== 'production') {
+      logger.warn('[startup] IDP_ENABLED=false. External writes will proceed without idempotency.');
+      return;
+    }
+
+    throw new Error('IDP_ENABLED=false is not allowed in production.');
+  }
+
+  const result = await initIdempotency(IDP_DB_PATH);
+  logger.info('[startup] Idempotency store initialized.', { dbPath: result.dbPath });
+}
+
 async function runHubspotIntake({ callSid, streamSid, callerPhone }) {
   if (!isHubspotEnabled()) {
     return { crmReady: false, reason: 'hubspot_disabled' };
@@ -125,9 +142,9 @@ async function runHubspotIntake({ callSid, streamSid, callerPhone }) {
   }
 
   try {
-    const { id: contactId } = await upsertContact({ phone: callerPhone });
+    const { id: contactId } = await upsertContact({ phone: callerPhone }, { callSid });
     const { id: dealId } = await createDeal({ contactId, callSid });
-    await associateDealToContact(dealId, contactId);
+    await associateDealToContact(dealId, contactId, { callSid });
     await logEngagement(dealId, contactId, { callSid });
 
     return {
@@ -433,8 +450,30 @@ server.on('upgrade', (req, socket, head) => {
   socket.destroy();
 });
 
-startSessionJanitor();
+async function bootstrap() {
+  try {
+    await initializeIdempotency();
+  } catch (error) {
+    logger.error('[startup] Idempotency initialization failed.', {
+      error: error.message,
+      dbPath: IDP_DB_PATH
+    });
 
-server.listen(PORT, '0.0.0.0', () => {
-  logger.info(`[startup] plumbing-voice-bridge listening on 0.0.0.0:${PORT}`);
-});
+    if (process.env.NODE_ENV === 'production') {
+      process.exit(1);
+      return;
+    }
+
+    logger.warn('[startup] Continuing in non-production despite idempotency init failure.', {
+      error: error.message
+    });
+  }
+
+  startSessionJanitor();
+
+  server.listen(PORT, '0.0.0.0', () => {
+    logger.info(`[startup] plumbing-voice-bridge listening on 0.0.0.0:${PORT}`);
+  });
+}
+
+bootstrap();

@@ -1,4 +1,5 @@
 const { filterContactProps, filterDealProps } = require('../governance/propertyAllowlist');
+const { buildIdempotencyKey, withIdempotency } = require('../governance/withIdempotency');
 
 const HUBSPOT_BASE_URL = 'https://api.hubapi.com';
 const LOCKED_PIPELINE_ID = '2047365827';
@@ -89,7 +90,7 @@ async function findContactByPhone(phoneE164) {
   };
 }
 
-async function upsertContact(contactProps) {
+async function upsertContact(contactProps, { callSid }) {
   const payload = filterContactProps(contactProps);
   const phone = payload.properties.phone;
 
@@ -100,22 +101,38 @@ async function upsertContact(contactProps) {
     });
   }
 
-  const existing = await findContactByPhone(phone);
-  if (existing) {
-    await hubspotRequest(`/crm/v3/objects/contacts/${existing.id}`, {
-      method: 'PATCH',
-      body: payload
-    });
-
-    return { id: existing.id };
-  }
-
-  const created = await hubspotRequest('/crm/v3/objects/contacts', {
-    method: 'POST',
-    body: payload
+  const key = buildIdempotencyKey({
+    tenant: 'single',
+    callSid,
+    operation: 'hubspot_upsert_contact',
+    inputs: {
+      phone,
+      propertiesWritten: payload.properties
+    }
   });
 
-  return { id: created.id };
+  return withIdempotency({
+    key,
+    loggerContext: { callSid, operation: 'hubspot_upsert_contact' },
+    fn: async () => {
+      const existing = await findContactByPhone(phone);
+      if (existing) {
+        await hubspotRequest(`/crm/v3/objects/contacts/${existing.id}`, {
+          method: 'PATCH',
+          body: payload
+        });
+
+        return { id: existing.id };
+      }
+
+      const created = await hubspotRequest('/crm/v3/objects/contacts', {
+        method: 'POST',
+        body: payload
+      });
+
+      return { id: created.id };
+    }
+  });
 }
 
 async function createDeal({ contactId, callSid }) {
@@ -125,56 +142,111 @@ async function createDeal({ contactId, callSid }) {
     call_disposition: 'missed_call_captured'
   });
 
-  const created = await hubspotRequest('/crm/v3/objects/deals', {
-    method: 'POST',
-    body: payload
+  const key = buildIdempotencyKey({
+    tenant: 'single',
+    callSid,
+    operation: 'hubspot_create_deal',
+    inputs: {
+      contactId,
+      pipelineId: LOCKED_PIPELINE_ID,
+      stageId: LOCKED_STAGE_ID,
+      callSid
+    }
   });
 
-  return { id: created.id, contactId, callSid };
+  return withIdempotency({
+    key,
+    loggerContext: { callSid, operation: 'hubspot_create_deal' },
+    fn: async () => {
+      const created = await hubspotRequest('/crm/v3/objects/deals', {
+        method: 'POST',
+        body: payload
+      });
+
+      return { id: created.id, contactId, callSid };
+    }
+  });
 }
 
-async function associateDealToContact(dealId, contactId) {
-  await hubspotRequest(`/crm/v3/objects/deals/${dealId}/associations/contacts/${contactId}/deal_to_contact`, {
-    method: 'PUT'
+async function associateDealToContact(dealId, contactId, { callSid }) {
+  const key = buildIdempotencyKey({
+    tenant: 'single',
+    callSid,
+    operation: 'hubspot_associate_deal_contact',
+    inputs: {
+      dealId,
+      contactId
+    }
+  });
+
+  return withIdempotency({
+    key,
+    loggerContext: { callSid, operation: 'hubspot_associate_deal_contact' },
+    fn: async () => {
+      await hubspotRequest(`/crm/v3/objects/deals/${dealId}/associations/contacts/${contactId}/deal_to_contact`, {
+        method: 'PUT'
+      });
+
+      return { ok: true };
+    }
   });
 }
 
 async function logEngagement(dealId, contactId, payload = {}) {
   const noteBody = 'Call started. TranscriptRef: pending. Summary: pending.';
+  const callSid = payload.callSid;
 
-  await hubspotRequest('/crm/v3/objects/notes', {
-    method: 'POST',
-    body: {
-      properties: {
-        hs_note_body: noteBody
-      },
-      associations: [
-        {
-          to: { id: String(dealId) },
-          types: [
-            {
-              associationCategory: 'HUBSPOT_DEFINED',
-              associationTypeId: 214
-            }
-          ]
-        },
-        {
-          to: { id: String(contactId) },
-          types: [
-            {
-              associationCategory: 'HUBSPOT_DEFINED',
-              associationTypeId: 202
-            }
-          ]
-        }
-      ]
+  const key = buildIdempotencyKey({
+    tenant: 'single',
+    callSid,
+    operation: 'hubspot_log_engagement',
+    inputs: {
+      dealId,
+      contactId,
+      callSid,
+      noteText: noteBody
     }
   });
 
-  return {
-    ok: true,
-    callSid: payload.callSid || null
-  };
+  return withIdempotency({
+    key,
+    loggerContext: { callSid, operation: 'hubspot_log_engagement' },
+    fn: async () => {
+      await hubspotRequest('/crm/v3/objects/notes', {
+        method: 'POST',
+        body: {
+          properties: {
+            hs_note_body: noteBody
+          },
+          associations: [
+            {
+              to: { id: String(dealId) },
+              types: [
+                {
+                  associationCategory: 'HUBSPOT_DEFINED',
+                  associationTypeId: 214
+                }
+              ]
+            },
+            {
+              to: { id: String(contactId) },
+              types: [
+                {
+                  associationCategory: 'HUBSPOT_DEFINED',
+                  associationTypeId: 202
+                }
+              ]
+            }
+          ]
+        }
+      });
+
+      return {
+        ok: true,
+        callSid: callSid || null
+      };
+    }
+  });
 }
 
 module.exports = {
