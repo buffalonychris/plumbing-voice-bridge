@@ -1,15 +1,22 @@
 const fs = require('fs');
-const path = require('path');
 const http = require('http');
 const express = require('express');
 const WebSocket = require('ws');
+const { validateEnv } = require('./config/env');
+const {
+  DEFAULT_PORT,
+  DEFAULT_OPENAI_REALTIME_MODEL,
+  DEFAULT_OPENAI_VOICE,
+  DEFAULT_OPERATOR_COMPANY_NAME,
+  DEFAULT_PROMPT_PATH
+} = require('./config/constants');
+const logger = require('./monitoring/logger');
 require('dotenv').config();
 
-const PORT = Number(process.env.PORT || 8080);
-const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
-const OPENAI_VOICE = process.env.OPENAI_VOICE || 'alloy';
-const OPERATOR_COMPANY_NAME = process.env.OPERATOR_COMPANY_NAME || 'Call Operator Pro Plumbing';
-const DEFAULT_PROMPT_PATH = path.join(__dirname, '..', 'prompts', 'plumbing_operator_system_prompt.txt');
+const PORT = Number(process.env.PORT || DEFAULT_PORT);
+const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || DEFAULT_OPENAI_REALTIME_MODEL;
+const OPENAI_VOICE = process.env.OPENAI_VOICE || DEFAULT_OPENAI_VOICE;
+const OPERATOR_COMPANY_NAME = process.env.OPERATOR_COMPANY_NAME || DEFAULT_OPERATOR_COMPANY_NAME;
 
 function loadSystemPrompt() {
   if (process.env.OPERATOR_SYSTEM_PROMPT && process.env.OPERATOR_SYSTEM_PROMPT.trim()) {
@@ -19,7 +26,7 @@ function loadSystemPrompt() {
   try {
     return fs.readFileSync(DEFAULT_PROMPT_PATH, 'utf8').trim();
   } catch (error) {
-    console.error('[startup] Failed to load default prompt file.', { error: error.message });
+    logger.error('[startup] Failed to load default prompt file.', { error: error.message });
     return `You are ${OPERATOR_COMPANY_NAME}, a plumbing call operator. Collect caller name, service address, issue description, and urgency.`;
   }
 }
@@ -35,8 +42,10 @@ app.get('/health', (_req, res) => {
 });
 
 app.post('/twilio/voice', (req, res) => {
-  if (!process.env.OPENAI_API_KEY) {
-    console.error('[twilio/voice] OPENAI_API_KEY is missing; refusing call setup.');
+  try {
+    validateEnv();
+  } catch (envError) {
+    logger.error('[twilio/voice] OPENAI_API_KEY is missing; refusing call setup.', { error: envError.message });
     return res.status(500).type('text/plain').send('Server misconfiguration');
   }
 
@@ -44,7 +53,7 @@ app.post('/twilio/voice', (req, res) => {
   const host = req.get('x-forwarded-host') || req.get('host');
   const streamUrl = `wss://${host}/twilio/stream`;
 
-  console.info('[twilio/voice] Building TwiML response.', { callSid, streamUrl });
+  logger.info('[twilio/voice] Building TwiML response.', { callSid, streamUrl });
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -81,12 +90,14 @@ function createOpenAiSocket() {
 }
 
 function logState(message, state = {}) {
-  console.info(`[stream] ${message}`, state);
+  logger.info(`[stream] ${message}`, state);
 }
 
 wsServer.on('connection', (twilioSocket, req) => {
-  if (!process.env.OPENAI_API_KEY) {
-    console.error('[stream] OPENAI_API_KEY missing; closing Twilio stream socket.');
+  try {
+    validateEnv();
+  } catch (envError) {
+    logger.error('[stream] OPENAI_API_KEY missing; closing Twilio stream socket.', { error: envError.message });
     twilioSocket.close(1011, 'Server misconfiguration');
     return;
   }
@@ -141,7 +152,7 @@ wsServer.on('connection', (twilioSocket, req) => {
 
       openAiSocket.send(JSON.stringify({ type: 'response.create' }));
       initialResponseCreateSent = true;
-      console.info('[openai] response.create sent', { callSid, streamSid });
+      logger.info('[openai] response.create sent', { callSid, streamSid });
     };
 
     openAiSocket.on('open', () => {
@@ -202,7 +213,7 @@ wsServer.on('connection', (twilioSocket, req) => {
           return;
         }
 
-        console.error('[stream] OpenAI Realtime error.', {
+        logger.error('[stream] OpenAI Realtime error.', {
           callSid,
           streamSid,
           error: msg.error || msg
@@ -224,7 +235,7 @@ wsServer.on('connection', (twilioSocket, req) => {
     });
 
     openAiSocket.on('error', (error) => {
-      console.error('[stream] OpenAI socket error.', { callSid, streamSid, error: error.message });
+      logger.error('[stream] OpenAI socket error.', { callSid, streamSid, error: error.message });
       closeBoth('openai_error');
     });
   };
@@ -246,7 +257,7 @@ wsServer.on('connection', (twilioSocket, req) => {
       if (openAiReady && sessionUpdateSent && !initialResponseCreateSent && openAiSocket?.readyState === WebSocket.OPEN) {
         openAiSocket.send(JSON.stringify({ type: 'response.create' }));
         initialResponseCreateSent = true;
-        console.info('[openai] response.create sent', { callSid, streamSid });
+        logger.info('[openai] response.create sent', { callSid, streamSid });
       }
       return;
     }
@@ -289,7 +300,7 @@ wsServer.on('connection', (twilioSocket, req) => {
   });
 
   twilioSocket.on('error', (error) => {
-    console.error('[stream] Twilio socket error.', { callSid, streamSid, error: error.message });
+    logger.error('[stream] Twilio socket error.', { callSid, streamSid, error: error.message });
     closeBoth('twilio_error');
   });
 });
@@ -308,5 +319,5 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.info(`[startup] plumbing-voice-bridge listening on 0.0.0.0:${PORT}`);
+  logger.info(`[startup] plumbing-voice-bridge listening on 0.0.0.0:${PORT}`);
 });

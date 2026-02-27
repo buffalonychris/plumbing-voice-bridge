@@ -19,12 +19,18 @@ Minimal production-grade voice bridge service for Phase 1 validation of a plumbi
 
 Copy `.env.example` to `.env` and fill values:
 
-- `OPENAI_API_KEY` (required)
+- `OPENAI_API_KEY` (**required for proxy startup behavior on Twilio voice + stream routes**)
 - `OPENAI_REALTIME_MODEL` (default: `gpt-4o-realtime-preview-2024-12-17`)
 - `OPENAI_VOICE` (default: `alloy`)
 - `OPERATOR_COMPANY_NAME` (default: `Call Operator Pro Plumbing`)
 - `OPERATOR_SYSTEM_PROMPT` (optional override; defaults to `prompts/plumbing_operator_system_prompt.txt`)
 - `PORT` (default: `8080`)
+
+
+## Local proxy requirements
+
+At minimum, set `OPENAI_API_KEY` before exercising `POST /twilio/voice` or `WS /twilio/stream`.
+The service can still boot and respond to `GET /health` without it, but voice/stream proxying will refuse requests until it is set.
 
 ## Local run
 
