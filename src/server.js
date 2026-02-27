@@ -77,6 +77,184 @@ function loadSystemPrompt() {
 
 const SYSTEM_PROMPT = loadSystemPrompt();
 
+const REALTIME_TOOL_DEFINITIONS = Object.freeze([
+  {
+    type: 'function',
+    name: 'capture_identity',
+    description: 'Capture caller identity before moving to address confirmation.',
+    parameters: {
+      type: 'object',
+      properties: {
+        firstname: { type: 'string' },
+        lastname: { type: 'string' },
+        phone: { type: 'string' }
+      },
+      required: ['firstname', 'lastname'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'confirm_address',
+    description: 'Capture service address after identity is checked.',
+    parameters: {
+      type: 'object',
+      properties: {
+        service_street_1: { type: 'string' },
+        service_city: { type: 'string' },
+        service_state: { type: 'string' },
+        service_postal_code: { type: 'string' }
+      },
+      required: ['service_street_1', 'service_city', 'service_state', 'service_postal_code'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'capture_problem',
+    description: 'Capture a short problem summary after address is confirmed.',
+    parameters: {
+      type: 'object',
+      properties: {
+        problem_summary: { type: 'string' }
+      },
+      required: ['problem_summary'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'begin_scheduling',
+    description: 'Enter scheduling mode once problem details are complete.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'propose_slots',
+    description: 'Propose calendar slots for an estimate appointment.',
+    parameters: {
+      type: 'object',
+      properties: {
+        count: { type: 'integer', minimum: 1, maximum: 5 },
+        serviceRadius: { type: 'string' }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'book_estimate',
+    description: 'Book one of the proposed estimate slots.',
+    parameters: {
+      type: 'object',
+      properties: {
+        slotStartISO: { type: 'string' },
+        slotIndex: { type: 'integer', minimum: 0 }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'request_sms_consent',
+    description: 'Record whether caller consents to receive SMS updates.',
+    parameters: {
+      type: 'object',
+      properties: {
+        consent: { type: 'boolean' }
+      },
+      required: ['consent'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'send_confirmation_sms',
+    description: 'Send an estimate confirmation SMS if caller consent exists.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'escalate_call',
+    description: 'Escalate the current call when manual takeover is required.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'finalize_and_log',
+    description: 'Finalize the call and log summary details.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    }
+  }
+]);
+
+function tryParseToolPayload(argumentsRaw) {
+  if (!argumentsRaw) {
+    return {};
+  }
+
+  if (typeof argumentsRaw === 'object') {
+    return argumentsRaw;
+  }
+
+  if (typeof argumentsRaw !== 'string') {
+    return {};
+  }
+
+  const trimmed = argumentsRaw.trim();
+  if (!trimmed) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(trimmed);
+  } catch (_error) {
+    return {
+      __raw: argumentsRaw
+    };
+  }
+}
+
+function getRealtimeToolCallRequest(msg) {
+  if (!msg || typeof msg !== 'object') {
+    return null;
+  }
+
+  if (msg.type === 'response.function_call_arguments.done') {
+    return {
+      callId: msg.call_id || msg.item_id || null,
+      toolName: msg.name || null,
+      payload: tryParseToolPayload(msg.arguments)
+    };
+  }
+
+  const outputItem = msg.response?.output_item || msg.item;
+  if (msg.type === 'response.output_item.done' && outputItem?.type === 'function_call') {
+    return {
+      callId: outputItem.call_id || outputItem.id || null,
+      toolName: outputItem.name || null,
+      payload: tryParseToolPayload(outputItem.arguments)
+    };
+  }
+
+  return null;
+}
+
 const app = express();
 
 const UNAVAILABLE_TWIML = `<?xml version="1.0" encoding="UTF-8"?>
@@ -430,6 +608,8 @@ wsServer.on('connection', (twilioSocket, req) => {
   let sessionUpdateSent = false;
   let initialResponseCreateSent = false;
   let callFinalized = false;
+  let toolExecutionQueue = Promise.resolve();
+  const handledToolCallIds = new Set();
 
   const setAgentSpeaking = (nextState, reason) => {
     if (agentSpeaking === nextState) {
@@ -509,6 +689,7 @@ wsServer.on('connection', (twilioSocket, req) => {
           voice: OPENAI_VOICE,
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
+          tools: REALTIME_TOOL_DEFINITIONS,
           turn_detection: {
             type: 'server_vad'
           }
@@ -540,6 +721,84 @@ wsServer.on('connection', (twilioSocket, req) => {
           }
         };
         twilioSocket.send(JSON.stringify(media));
+      }
+
+      const toolRequest = getRealtimeToolCallRequest(msg);
+      if (toolRequest && toolRequest.toolName) {
+        const toolCallId = toolRequest.callId || `tool-call-${crypto.createHash('sha1')
+          .update(`${toolRequest.toolName}:${JSON.stringify(toolRequest.payload || {})}`)
+          .digest('hex')}`;
+        if (handledToolCallIds.has(toolCallId)) {
+          logger.info('[tools] Realtime duplicate tool call ignored.', {
+            callSid,
+            streamSid,
+            toolName: toolRequest.toolName,
+            toolCallId
+          });
+          return;
+        }
+
+        handledToolCallIds.add(toolCallId);
+        logger.info('[tools] Realtime tool requested.', {
+          callSid,
+          streamSid,
+          toolName: toolRequest.toolName,
+          toolCallId
+        });
+
+        toolExecutionQueue = toolExecutionQueue
+          .then(async () => {
+            logger.info('[tools] Realtime tool dispatching.', {
+              callSid,
+              streamSid,
+              toolName: toolRequest.toolName,
+              toolCallId
+            });
+
+            const result = await dispatchTool({
+              callSid,
+              toolName: toolRequest.toolName,
+              payload: toolRequest.payload || {}
+            });
+
+            logger.info('[tools] Realtime tool result.', {
+              callSid,
+              streamSid,
+              toolName: toolRequest.toolName,
+              toolCallId,
+              ok: result?.ok === true,
+              errorCode: result?.error?.code || null
+            });
+
+            if (!openAiSocket || openAiSocket.readyState !== WebSocket.OPEN) {
+              logger.warn('[tools] Realtime tool result dropped because socket is closed.', {
+                callSid,
+                streamSid,
+                toolName: toolRequest.toolName,
+                toolCallId
+              });
+              return;
+            }
+
+            openAiSocket.send(JSON.stringify({
+              type: 'conversation.item.create',
+              item: {
+                type: 'function_call_output',
+                call_id: toolCallId,
+                output: JSON.stringify(result)
+              }
+            }));
+            openAiSocket.send(JSON.stringify({ type: 'response.create' }));
+          })
+          .catch((error) => {
+            logger.error('[tools] Realtime tool execution failed.', {
+              callSid,
+              streamSid,
+              toolName: toolRequest.toolName,
+              toolCallId,
+              error: error.message
+            });
+          });
       }
 
       if (msg.type === 'error') {
