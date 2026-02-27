@@ -1,12 +1,56 @@
+const REQUIRED_FIELDS_BY_TRANSITION = Object.freeze({
+  CALL_STARTED: {
+    IDENTITY_CHECKED: ['contact.firstname', 'contact.lastname']
+  },
+  IDENTITY_CHECKED: {
+    ADDRESS_CONFIRMED: [
+      'address.service_street_1',
+      'address.service_city',
+      'address.service_state',
+      'address.service_postal_code'
+    ]
+  },
+  ADDRESS_CONFIRMED: {
+    PROBLEM_CAPTURED: ['problem.problem_summary']
+  },
+  PROBLEM_CAPTURED: {
+    SCHEDULING: ['hubspot.crmReady', 'hubspot.contactId', 'hubspot.dealId', 'problem.problem_summary']
+  }
+});
+
+function getByPath(obj, path) {
+  return path.split('.').reduce((acc, key) => {
+    if (acc == null) {
+      return undefined;
+    }
+
+    return acc[key];
+  }, obj);
+}
+
+function hasRequiredFieldsForTransition(session, nextState) {
+  const fromState = session?.state;
+  const requiredPaths = REQUIRED_FIELDS_BY_TRANSITION[fromState]?.[nextState] || [];
+
+  const missing = requiredPaths.filter((path) => {
+    const value = getByPath(session, path);
+    if (typeof value === 'boolean') {
+      return value !== true;
+    }
+
+    return value == null || value === '';
+  });
+
+  return {
+    ok: missing.length === 0,
+    fromState,
+    nextState,
+    requiredPaths,
+    missing
+  };
+}
+
 module.exports = {
-  CALL_STARTED: ['callerName'],
-  IDENTITY_CHECKED: ['identityVerified'],
-  ADDRESS_CONFIRMED: ['serviceAddress'],
-  PROBLEM_CAPTURED: ['problemDescription'],
-  SCHEDULING: ['preferredTimeWindow'],
-  BOOKED: ['bookingReference'],
-  CONFIRMED_SMS_SENT: ['smsConfirmationId'],
-  LOGGED_TO_HUBSPOT: ['hubspotRecordId'],
-  ESCALATED: ['escalationReason'],
-  CALL_ENDED: []
+  REQUIRED_FIELDS_BY_TRANSITION,
+  hasRequiredFieldsForTransition
 };

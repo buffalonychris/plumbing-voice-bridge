@@ -193,7 +193,7 @@ async function associateDealToContact(dealId, contactId, { callSid }) {
 }
 
 async function logEngagement(dealId, contactId, payload = {}) {
-  const noteBody = 'Call started. TranscriptRef: pending. Summary: pending.';
+  const noteBody = payload.noteBody || 'Call started. TranscriptRef: pending. Summary: pending.';
   const callSid = payload.callSid;
 
   const key = buildIdempotencyKey({
