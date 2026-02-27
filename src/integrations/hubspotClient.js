@@ -90,6 +90,21 @@ async function findContactByPhone(phoneE164) {
   };
 }
 
+async function getContactById(contactId) {
+  if (!contactId) {
+    throw buildError({
+      message: 'Contact lookup requires contactId',
+      code: 'missing_contact_id'
+    });
+  }
+
+  const result = await hubspotRequest(`/crm/v3/objects/contacts/${contactId}?properties=phone,sms_customer_consent,sms_customer_consent_ts`);
+  return {
+    id: result.id,
+    properties: result.properties || {}
+  };
+}
+
 async function upsertContact(contactProps, { callSid }) {
   const payload = filterContactProps(contactProps);
   const phone = payload.properties.phone;
@@ -292,13 +307,58 @@ async function updateDealStage({ dealId, pipelineId, dealstage, callSid }) {
     }
   });
 }
+
+async function updateContactConsent({ contactId, consent, consentTsISO, callSid }) {
+  if (!contactId) {
+    throw buildError({
+      message: 'Contact consent update requires contactId',
+      code: 'missing_contact_id'
+    });
+  }
+
+  const payload = filterContactProps({
+    sms_customer_consent: consent,
+    sms_customer_consent_ts: consentTsISO
+  });
+
+  const key = buildIdempotencyKey({
+    tenant: 'single',
+    callSid,
+    operation: 'hubspot_update_sms_consent',
+    inputs: {
+      contactId,
+      consent,
+      consentTsISO
+    }
+  });
+
+  return withIdempotency({
+    key,
+    loggerContext: { callSid, operation: 'hubspot_update_sms_consent' },
+    fn: async () => {
+      await hubspotRequest(`/crm/v3/objects/contacts/${contactId}`, {
+        method: 'PATCH',
+        body: payload
+      });
+
+      return {
+        ok: true,
+        contactId,
+        consent,
+        consentTsISO
+      };
+    }
+  });
+}
 module.exports = {
   findContactByPhone,
+  getContactById,
   upsertContact,
   createDeal,
   associateDealToContact,
   logEngagement,
   updateDealStage,
+  updateContactConsent,
   LOCKED_PIPELINE_ID,
   LOCKED_STAGE_ID
 };
