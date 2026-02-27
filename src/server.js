@@ -27,6 +27,7 @@ const {
   associateDealToContact,
   logEngagement
 } = require('./integrations/hubspotClient');
+const { dispatchTool } = require('./runtime/toolRouter');
 require('dotenv').config();
 
 try {
@@ -64,6 +65,18 @@ app.use(express.json());
 
 app.get('/health', (_req, res) => {
   res.status(200).json({ ok: true, service: 'plumbing-voice-bridge' });
+});
+
+app.post('/internal/tools/:callSid', async (req, res) => {
+  const toolingEnabled = String(process.env.INTERNAL_TOOLING_ENABLED || '').trim().toLowerCase() === 'true';
+  if (!toolingEnabled) {
+    return res.status(404).json({ ok: false });
+  }
+
+  const { callSid } = req.params;
+  const { toolName, payload } = req.body || {};
+  const result = await dispatchTool({ callSid, toolName, payload });
+  return res.status(result.ok ? 200 : 400).json(result);
 });
 
 app.post('/twilio/voice', (req, res) => {

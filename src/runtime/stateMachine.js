@@ -30,6 +30,10 @@ function canTransition(from, to) {
     return true;
   }
 
+  if (to === 'LOGGED_TO_HUBSPOT') {
+    return ['PROBLEM_CAPTURED', 'SCHEDULING', 'BOOKED', 'CONFIRMED_SMS_SENT', 'ESCALATED'].includes(from);
+  }
+
   const fromIndex = STATES.indexOf(from);
   const toIndex = STATES.indexOf(to);
   return toIndex === fromIndex + 1;

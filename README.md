@@ -30,7 +30,7 @@ Copy `.env.example` to `.env` and fill values:
 - `IDP_ENABLED` (default: `true`; in non-production you can set `false` to bypass idempotency with a warning log)
 - `IDP_DB_PATH` (default local: `./.data/idempotency.sqlite`; Fly recommended: `/data/idempotency.sqlite`)
 - `PORT` (default: `8080`)
-
+- `INTERNAL_TOOLING_ENABLED` (default: `false`; when `true`, enables internal deterministic tool testing route `POST /internal/tools/:callSid`)
 
 
 ### Idempotency persistence (SQLite)
@@ -96,6 +96,60 @@ Expected: XML TwiML including `<Start><Stream url="wss://.../twilio/stream"/></S
 ### WebSocket testing note
 
 `/twilio/stream` is driven by Twilio Media Streams during live calls. Local manual WS tests are optional and intentionally minimal in this Phase 1 bridge.
+
+
+## Internal deterministic tooling (PR4)
+
+Enable internal tooling endpoint locally:
+
+```bash
+export INTERNAL_TOOLING_ENABLED=true
+```
+
+This enables:
+
+- `POST /internal/tools/:callSid`
+
+Request body:
+
+```json
+{ "toolName": "capture_identity", "payload": { ... } }
+```
+
+Example sequence (other tools are not implemented yet and return `not_implemented`):
+
+```bash
+# 1) capture_identity
+curl -s -X POST http://localhost:8080/internal/tools/CA123 \
+  -H 'Content-Type: application/json' \
+  -d '{"toolName":"capture_identity","payload":{"firstname":"Ada","lastname":"Lovelace","phone":"+15551234567"}}'
+
+# 2) confirm_address
+curl -s -X POST http://localhost:8080/internal/tools/CA123 \
+  -H 'Content-Type: application/json' \
+  -d '{"toolName":"confirm_address","payload":{"service_street_1":"123 Main St","service_city":"Austin","service_state":"TX","service_postal_code":"78701"}}'
+
+# 3) capture_problem
+curl -s -X POST http://localhost:8080/internal/tools/CA123 \
+  -H 'Content-Type: application/json' \
+  -d '{"toolName":"capture_problem","payload":{"problem_summary":"Kitchen sink leak under cabinet"}}'
+
+# 4) begin_scheduling
+curl -s -X POST http://localhost:8080/internal/tools/CA123 \
+  -H 'Content-Type: application/json' \
+  -d '{"toolName":"begin_scheduling","payload":{}}'
+
+# 5) finalize_and_log
+curl -s -X POST http://localhost:8080/internal/tools/CA123 \
+  -H 'Content-Type: application/json' \
+  -d '{"toolName":"finalize_and_log","payload":{}}'
+```
+
+For a local non-HTTP smoke check, run:
+
+```bash
+node scripts/smoke_pr4_tools.js
+```
 
 ## Twilio setup
 
