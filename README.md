@@ -25,6 +25,8 @@ Copy `.env.example` to `.env` and fill values:
 - `OPERATOR_COMPANY_NAME` (default: `Call Operator Pro Plumbing`)
 - `OPERATOR_SYSTEM_PROMPT` (optional override; defaults to `prompts/plumbing_operator_system_prompt.txt`)
 - `SESSION_TTL_MINUTES` (default: `30`)
+- `HUBSPOT_ENABLED` (default: `false`; set to `true` to enable CRM intake on Twilio stream start)
+- `HUBSPOT_ACCESS_TOKEN` (required only when `HUBSPOT_ENABLED=true`)
 - `PORT` (default: `8080`)
 
 
@@ -41,6 +43,16 @@ npm start
 ```
 
 Service binds to `0.0.0.0:${PORT:-8080}`.
+
+### HubSpot toggle behavior
+
+- Keep `HUBSPOT_ENABLED=false` locally to disable CRM intake and preserve relay-only behavior.
+- Set `HUBSPOT_ENABLED=true` and provide `HUBSPOT_ACCESS_TOKEN` to run HubSpot intake on Twilio stream start.
+
+Manual test:
+
+1. Start service with `HUBSPOT_ENABLED=false`; place a call and confirm Twilio ↔ OpenAI relay still works.
+2. Restart with `HUBSPOT_ENABLED=true` plus valid `HUBSPOT_ACCESS_TOKEN`; place a call and observe HubSpot intake logs on stream start.
 
 ### Minimal local checks
 
