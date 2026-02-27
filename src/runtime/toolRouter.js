@@ -3,6 +3,7 @@ const sessionStore = require('./sessionStore');
 const { assertState, canTransition, transition } = require('./stateMachine');
 const { hasRequiredFieldsForTransition } = require('./requiredFields');
 const hubspotClient = require('../integrations/hubspotClient');
+const calendarClient = require('../integrations/calendarClient');
 
 const ALLOWED_TOOLS = Object.freeze([
   'capture_identity',
@@ -58,6 +59,52 @@ function validateString(payload, key, { optional = false } = {}) {
       details: { field: key }
     });
   }
+}
+
+
+const LOCKED_ESTIMATE_SCHEDULED_STAGE_ID = '3233958615';
+
+function hasCrmSchedulingContext(session) {
+  return session?.hubspot?.crmReady === true
+    && Boolean(session?.hubspot?.contactId)
+    && Boolean(session?.hubspot?.dealId);
+}
+
+function assertSchedulingPreconditions(session) {
+  if (!hasCrmSchedulingContext(session)) {
+    throw Object.assign(new Error('Scheduling requires crmReady with contact and deal IDs'), {
+      code: 'missing_prerequisites'
+    });
+  }
+}
+
+function findSelectedSlot(payload, proposedSlots) {
+  if (payload.slotStartISO) {
+    const match = proposedSlots.find((slot) => slot.startISO === payload.slotStartISO);
+    if (!match) {
+      throw Object.assign(new Error('Selected slot does not exist in proposed slots'), {
+        code: 'invalid_payload',
+        details: { field: 'slotStartISO' }
+      });
+    }
+    return match;
+  }
+
+  if (payload.slotIndex != null) {
+    if (!Number.isInteger(payload.slotIndex) || payload.slotIndex < 0 || payload.slotIndex >= proposedSlots.length) {
+      throw Object.assign(new Error('slotIndex is out of range'), {
+        code: 'invalid_payload',
+        details: { field: 'slotIndex' }
+      });
+    }
+
+    return proposedSlots[payload.slotIndex];
+  }
+
+  throw Object.assign(new Error('book_estimate requires slotStartISO or slotIndex'), {
+    code: 'invalid_payload',
+    details: { field: 'slotStartISO|slotIndex' }
+  });
 }
 
 function assertRequiredForTransition(session, nextState) {
@@ -189,14 +236,7 @@ async function handleCaptureProblem({ callSid, session, payload }) {
 async function handleBeginScheduling({ session }) {
   assertAllowedState(session, ['PROBLEM_CAPTURED']);
 
-  const hasHubspotContext = session?.hubspot?.crmReady === true
-    && Boolean(session?.hubspot?.contactId)
-    && Boolean(session?.hubspot?.dealId);
-  if (!hasHubspotContext) {
-    throw Object.assign(new Error('Scheduling requires crmReady with contact and deal IDs'), {
-      code: 'missing_prerequisites'
-    });
-  }
+  assertSchedulingPreconditions(session);
 
   assertRequiredForTransition(session, 'SCHEDULING');
   assertTransitionAllowed(session, 'SCHEDULING');
@@ -206,6 +246,108 @@ async function handleBeginScheduling({ session }) {
     next: 'propose_slots',
     window: 'next_business_hours'
   });
+}
+
+
+async function handleProposeSlots({ session, payload }) {
+  assertAllowedState(session, ['SCHEDULING']);
+  assertSchedulingPreconditions(session);
+
+  const requestedCount = payload.count == null ? 3 : Number(payload.count);
+  if (!Number.isInteger(requestedCount) || requestedCount <= 0) {
+    throw Object.assign(new Error('count must be a positive integer'), {
+      code: 'invalid_payload',
+      details: { field: 'count' }
+    });
+  }
+
+  const count = Math.min(requestedCount, 5);
+  const nowISO = new Date().toISOString();
+  const proposedSlots = await calendarClient.proposeSlots({ count, nowISO });
+
+  session.scheduling = {
+    proposedSlots,
+    proposedAtISO: nowISO,
+    serviceRadius: payload.serviceRadius || null
+  };
+
+  return success('propose_slots', session, {
+    proposedSlots
+  });
+}
+
+async function handleBookEstimate({ callSid, session, payload }) {
+  assertAllowedState(session, ['SCHEDULING']);
+  assertSchedulingPreconditions(session);
+
+  const proposedSlots = session?.scheduling?.proposedSlots || [];
+  if (!Array.isArray(proposedSlots) || proposedSlots.length === 0) {
+    throw Object.assign(new Error('No proposed slots available to book'), {
+      code: 'missing_prerequisites',
+      details: { field: 'scheduling.proposedSlots' }
+    });
+  }
+
+  const problemSummary = session?.problem?.problem_summary;
+  if (!problemSummary) {
+    throw Object.assign(new Error('problem_summary is required before booking'), {
+      code: 'missing_prerequisites',
+      details: { field: 'problem.problem_summary' }
+    });
+  }
+
+  const selectedSlot = findSelectedSlot(payload, proposedSlots);
+
+  try {
+    const booking = await calendarClient.bookSlot({
+      callSid,
+      slotStartISO: selectedSlot.startISO,
+      slotEndISO: selectedSlot.endISO,
+      summary: `Plumbing Estimate - ${session.contact?.firstname || 'Customer'} ${session.contact?.lastname || ''}`.trim(),
+      description: `Problem summary: ${problemSummary}`,
+      attendees: [{ phone: session.callerPhone }]
+    });
+
+    session.booking = booking;
+
+    await hubspotClient.updateDealStage({
+      dealId: session.hubspot.dealId,
+      pipelineId: hubspotClient.LOCKED_PIPELINE_ID,
+      dealstage: LOCKED_ESTIMATE_SCHEDULED_STAGE_ID,
+      callSid
+    });
+
+    const noteBody = `Estimate booked for ${booking.startISO} to ${booking.endISO}. Calendar event: ${booking.calendarEventId}. Link: ${booking.htmlLink || 'n/a'}`;
+    await hubspotClient.logEngagement(session.hubspot.dealId, session.hubspot.contactId, {
+      callSid,
+      noteBody
+    });
+
+    assertTransitionAllowed(session, 'BOOKED');
+    transition(session, 'BOOKED', 'tool:book_estimate');
+
+    return success('book_estimate', session, {
+      booking
+    });
+  } catch (error) {
+    logger.error('[tools] book_estimate failed.', {
+      callSid,
+      streamSid: session.streamSid,
+      tool: 'book_estimate',
+      message: error.message
+    });
+
+    if (session?.hubspot?.crmReady === true && session?.hubspot?.dealId && session?.hubspot?.contactId) {
+      await hubspotClient.logEngagement(session.hubspot.dealId, session.hubspot.contactId, {
+        callSid,
+        noteBody: `Calendar booking failed: ${error.message.slice(0, 160)}`
+      });
+    }
+
+    return buildError('book_estimate', 'calendar_booking_failed', 'Failed to book estimate slot', {
+      message: error.message
+    });
+  }
 }
 
 async function handleFinalizeAndLog({ callSid, session }) {
@@ -243,6 +385,8 @@ const handlers = {
   confirm_address: handleConfirmAddress,
   capture_problem: handleCaptureProblem,
   begin_scheduling: handleBeginScheduling,
+  propose_slots: handleProposeSlots,
+  book_estimate: handleBookEstimate,
   finalize_and_log: handleFinalizeAndLog
 };
 

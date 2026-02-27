@@ -249,12 +249,56 @@ async function logEngagement(dealId, contactId, payload = {}) {
   });
 }
 
+
+async function updateDealStage({ dealId, pipelineId, dealstage, callSid }) {
+  if (!dealId) {
+    throw buildError({
+      message: 'Deal stage update requires dealId',
+      code: 'missing_deal_id'
+    });
+  }
+
+  const payload = filterDealProps({
+    pipeline: pipelineId,
+    dealstage
+  });
+
+  const key = buildIdempotencyKey({
+    tenant: 'single',
+    callSid,
+    operation: 'hubspot_update_deal_stage',
+    inputs: {
+      dealId,
+      pipelineId,
+      dealstage
+    }
+  });
+
+  return withIdempotency({
+    key,
+    loggerContext: { callSid, operation: 'hubspot_update_deal_stage' },
+    fn: async () => {
+      await hubspotRequest(`/crm/v3/objects/deals/${dealId}`, {
+        method: 'PATCH',
+        body: payload
+      });
+
+      return {
+        ok: true,
+        dealId,
+        pipelineId,
+        dealstage
+      };
+    }
+  });
+}
 module.exports = {
   findContactByPhone,
   upsertContact,
   createDeal,
   associateDealToContact,
   logEngagement,
+  updateDealStage,
   LOCKED_PIPELINE_ID,
   LOCKED_STAGE_ID
 };
