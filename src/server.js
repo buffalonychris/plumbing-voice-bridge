@@ -11,6 +11,14 @@ const {
   DEFAULT_PROMPT_PATH
 } = require('./config/constants');
 const logger = require('./monitoring/logger');
+const {
+  createSession,
+  getSession,
+  touchSession,
+  endSession,
+  startSessionJanitor
+} = require('./runtime/sessionStore');
+const { transition } = require('./runtime/stateMachine');
 require('dotenv').config();
 
 const PORT = Number(process.env.PORT || DEFAULT_PORT);
@@ -111,6 +119,7 @@ wsServer.on('connection', (twilioSocket, req) => {
   let twilioStreamStarted = false;
   let sessionUpdateSent = false;
   let initialResponseCreateSent = false;
+  let callFinalized = false;
 
   const setAgentSpeaking = (nextState, reason) => {
     if (agentSpeaking === nextState) {
@@ -136,6 +145,29 @@ wsServer.on('connection', (twilioSocket, req) => {
     if (openAiSocket && openAiSocket.readyState === WebSocket.OPEN) {
       openAiSocket.close();
     }
+  };
+
+  const finalizeCall = (reason) => {
+    if (callFinalized || callSid === 'unknown-call') {
+      return;
+    }
+
+    const session = getSession(callSid);
+    if (session && session.state !== 'CALL_ENDED') {
+      try {
+        transition(session, 'CALL_ENDED', reason);
+      } catch (error) {
+        logger.error('[state] Failed to transition to CALL_ENDED.', {
+          callSid,
+          streamSid,
+          reason,
+          error: error.message
+        });
+      }
+    }
+
+    endSession(callSid, reason);
+    callFinalized = true;
   };
 
   const initializeOpenAi = () => {
@@ -248,11 +280,19 @@ wsServer.on('connection', (twilioSocket, req) => {
       return;
     }
 
+    if (callSid !== 'unknown-call') {
+      touchSession(callSid);
+    }
+
     if (msg.event === 'start') {
       callSid = msg.start?.callSid || callSid;
       streamSid = msg.start?.streamSid || streamSid;
       twilioStreamStarted = true;
       logState('Twilio stream started.', { callSid, streamSid });
+
+      const callerPhone = msg.start?.customParameters?.From || msg.start?.from;
+      const session = createSession(callSid, streamSid, callerPhone);
+      transition(session, 'CALL_STARTED', 'twilio_stream_start');
 
       if (openAiReady && sessionUpdateSent && !initialResponseCreateSent && openAiSocket?.readyState === WebSocket.OPEN) {
         openAiSocket.send(JSON.stringify({ type: 'response.create' }));
@@ -288,12 +328,14 @@ wsServer.on('connection', (twilioSocket, req) => {
 
     if (msg.event === 'stop') {
       logState('Twilio stream stop received.', { callSid, streamSid });
+      finalizeCall('twilio_stop');
       closeBoth('twilio_stop');
     }
   });
 
   twilioSocket.on('close', () => {
     logState('Twilio socket closed.', { callSid, streamSid });
+    finalizeCall('twilio_close');
     if (openAiSocket && openAiSocket.readyState === WebSocket.OPEN) {
       openAiSocket.close();
     }
@@ -317,6 +359,8 @@ server.on('upgrade', (req, socket, head) => {
 
   socket.destroy();
 });
+
+startSessionJanitor();
 
 server.listen(PORT, '0.0.0.0', () => {
   logger.info(`[startup] plumbing-voice-bridge listening on 0.0.0.0:${PORT}`);

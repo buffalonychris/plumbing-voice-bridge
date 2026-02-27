@@ -24,6 +24,7 @@ Copy `.env.example` to `.env` and fill values:
 - `OPENAI_VOICE` (default: `alloy`)
 - `OPERATOR_COMPANY_NAME` (default: `Call Operator Pro Plumbing`)
 - `OPERATOR_SYSTEM_PROMPT` (optional override; defaults to `prompts/plumbing_operator_system_prompt.txt`)
+- `SESSION_TTL_MINUTES` (default: `30`)
 - `PORT` (default: `8080`)
 
 
@@ -128,3 +129,18 @@ Look for stream lifecycle logs including `callSid`, `streamSid`, and connection 
 ## Notes on audio format
 
 Twilio Media Streams sends 8k μ-law (`g711_ulaw`) audio payloads. This bridge configures OpenAI Realtime session input and output audio format as `g711_ulaw`, so no explicit transcoding pipeline is required in Phase 1.
+
+## Session TTL testing
+
+The in-memory session store expires inactive calls based on `lastSeenAt` using `SESSION_TTL_MINUTES`. A janitor checks every 60 seconds.
+
+Manual test:
+
+1. Start service with a short TTL, for example `SESSION_TTL_MINUTES=1`.
+2. Place a call and confirm normal stream logs (`start`, media relay, and close path).
+3. Leave a session inactive longer than the TTL.
+4. Check logs for expiration with `reason="ttl_expired"` and fields `callSid`, `streamSid`, `lastSeenAt`, and `ttlMinutes`.
+
+## Proxy behavior compatibility
+
+`POST /twilio/voice` response shape and the Twilio ↔ OpenAI relay flow remain unchanged. The new state/session modules only add lifecycle bookkeeping and structured transition/session logs.
