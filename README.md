@@ -27,6 +27,11 @@ Copy `.env.example` to `.env` and fill values:
 - `SESSION_TTL_MINUTES` (default: `30`)
 - `HUBSPOT_ENABLED` (default: `false`; set to `true` to enable CRM intake on Twilio stream start)
 - `HUBSPOT_ACCESS_TOKEN` (required only when `HUBSPOT_ENABLED=true`)
+- `GOOGLE_CLIENT_ID` (required for scheduling tools)
+- `GOOGLE_CLIENT_SECRET` (required for scheduling tools)
+- `GOOGLE_REFRESH_TOKEN` (required for scheduling tools)
+- `GOOGLE_CALENDAR_ID` (required for scheduling tools)
+- `BUSINESS_TIMEZONE` (default: `America/New_York`; used for deterministic business-hours slot generation)
 - `IDP_ENABLED` (default: `true`; in non-production you can set `false` to bypass idempotency with a warning log)
 - `IDP_DB_PATH` (default local: `./.data/idempotency.sqlite`; Fly recommended: `/data/idempotency.sqlite`)
 - `PORT` (default: `8080`)
@@ -42,6 +47,16 @@ HubSpot write operations are protected by a persistent idempotency layer using N
 ```
 
 For Phase 1, `tenant` is fixed to `single` and idempotency is enabled by default.
+
+
+### Google Calendar setup (Phase 1)
+
+1. In Google Cloud, create OAuth credentials for a web/desktop client.
+2. Enable the Google Calendar API for the project.
+3. Generate a refresh token with calendar scope (`https://www.googleapis.com/auth/calendar`).
+4. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, and `GOOGLE_CALENDAR_ID` in your environment.
+
+Scheduling defaults are locked in Phase 1: Monday-Friday, 8:00-17:00 business hours, 60-minute appointment duration, and 2-hour minimum lead time.
 
 ## Local proxy requirements
 
@@ -98,7 +113,7 @@ Expected: XML TwiML including `<Start><Stream url="wss://.../twilio/stream"/></S
 `/twilio/stream` is driven by Twilio Media Streams during live calls. Local manual WS tests are optional and intentionally minimal in this Phase 1 bridge.
 
 
-## Internal deterministic tooling (PR4)
+## Internal deterministic tooling (PR5)
 
 Enable internal tooling endpoint locally:
 
@@ -116,7 +131,7 @@ Request body:
 { "toolName": "capture_identity", "payload": { ... } }
 ```
 
-Example sequence (other tools are not implemented yet and return `not_implemented`):
+Example sequence for PR5 scheduling flow:
 
 ```bash
 # 1) capture_identity
@@ -139,7 +154,17 @@ curl -s -X POST http://localhost:8080/internal/tools/CA123 \
   -H 'Content-Type: application/json' \
   -d '{"toolName":"begin_scheduling","payload":{}}'
 
-# 5) finalize_and_log
+# 5) propose_slots
+curl -s -X POST http://localhost:8080/internal/tools/CA123 \
+  -H 'Content-Type: application/json' \
+  -d '{"toolName":"propose_slots","payload":{"count":3}}'
+
+# 6) book_estimate (choose by index from proposed slots)
+curl -s -X POST http://localhost:8080/internal/tools/CA123 \
+  -H 'Content-Type: application/json' \
+  -d '{"toolName":"book_estimate","payload":{"slotIndex":0}}'
+
+# 7) finalize_and_log
 curl -s -X POST http://localhost:8080/internal/tools/CA123 \
   -H 'Content-Type: application/json' \
   -d '{"toolName":"finalize_and_log","payload":{}}'
@@ -148,7 +173,7 @@ curl -s -X POST http://localhost:8080/internal/tools/CA123 \
 For a local non-HTTP smoke check, run:
 
 ```bash
-node scripts/smoke_pr4_tools.js
+node scripts/smoke_pr5_booking.js
 ```
 
 ## Twilio setup
