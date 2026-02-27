@@ -12,6 +12,7 @@ const {
   DEFAULT_PROMPT_PATH
 } = require('./config/constants');
 const logger = require('./monitoring/logger');
+const { alertCritical, ALERT_EVENT_TYPES } = require('./monitoring/alerting');
 const { initIdempotency } = require('./governance/idempotencyStore');
 const {
   createSession,
@@ -301,6 +302,15 @@ async function runHubspotIntake({ callSid, streamSid, callerPhone }) {
       details: error.details
     });
 
+    await alertCritical(ALERT_EVENT_TYPES.HUBSPOT_WRITE_FAILURE, {
+      callSid,
+      streamSid,
+      source: 'server.runHubspotIntake',
+      message: error.message,
+      status: error.status || null,
+      errorCode: error.code || 'hubspot_intake_failed'
+    });
+
     return {
       crmReady: false,
       reason: 'hubspot_error',
@@ -459,16 +469,38 @@ wsServer.on('connection', (twilioSocket, req) => {
           streamSid,
           error: msg.error || msg
         });
+        alertCritical(ALERT_EVENT_TYPES.OPENAI_SESSION_FAILURE, {
+          callSid,
+          streamSid,
+          source: 'server.openAiSocket.message',
+          message: msg.error?.message || 'OpenAI realtime error message',
+          errorCode: msg.error?.code || 'openai_realtime_error',
+          details: msg.error || msg
+        }).catch((alertError) => {
+          logger.error('[alerting] Failed to send OpenAI message alert.', { callSid, streamSid, error: alertError.message });
+        });
       }
     });
 
     openAiSocket.on('close', (code, reasonBuffer) => {
       openAiReady = false;
+      const closeReason = reasonBuffer?.toString() || '';
       logState('OpenAI socket closed.', {
         callSid,
         streamSid,
         code,
-        reason: reasonBuffer?.toString() || ''
+        reason: closeReason
+      });
+      alertCritical(ALERT_EVENT_TYPES.OPENAI_SESSION_FAILURE, {
+        callSid,
+        streamSid,
+        source: 'server.openAiSocket.close',
+        message: `OpenAI socket closed (${code})`,
+        errorCode: 'openai_socket_closed',
+        status: code,
+        reason: closeReason
+      }).catch((alertError) => {
+        logger.error('[alerting] Failed to send OpenAI close alert.', { callSid, streamSid, error: alertError.message });
       });
       if (twilioSocket.readyState === WebSocket.OPEN) {
         twilioSocket.close();
@@ -477,6 +509,15 @@ wsServer.on('connection', (twilioSocket, req) => {
 
     openAiSocket.on('error', (error) => {
       logger.error('[stream] OpenAI socket error.', { callSid, streamSid, error: error.message });
+      alertCritical(ALERT_EVENT_TYPES.OPENAI_SESSION_FAILURE, {
+        callSid,
+        streamSid,
+        source: 'server.openAiSocket.error',
+        message: error.message,
+        errorCode: error.code || 'openai_socket_error'
+      }).catch((alertError) => {
+        logger.error('[alerting] Failed to send OpenAI error alert.', { callSid, streamSid, error: alertError.message });
+      });
       closeBoth('openai_error');
     });
   };
@@ -507,11 +548,18 @@ wsServer.on('connection', (twilioSocket, req) => {
         .then((hubspot) => {
           updateSession(callSid, { hubspot });
         })
-        .catch((error) => {
+        .catch(async (error) => {
           logger.error('[hubspot] Unexpected intake failure.', {
             callSid,
             streamSid,
             error: error.message
+          });
+          await alertCritical(ALERT_EVENT_TYPES.HUBSPOT_WRITE_FAILURE, {
+            callSid,
+            streamSid,
+            source: 'server.twilioSocket.start',
+            message: error.message,
+            errorCode: error.code || 'hubspot_intake_unexpected'
           });
           updateSession(callSid, {
             hubspot: {
@@ -564,6 +612,15 @@ wsServer.on('connection', (twilioSocket, req) => {
 
   twilioSocket.on('close', () => {
     logState('Twilio socket closed.', { callSid, streamSid });
+    alertCritical(ALERT_EVENT_TYPES.TWILIO_STREAM_FAILURE, {
+      callSid,
+      streamSid,
+      source: 'server.twilioSocket.close',
+      message: 'Twilio socket closed',
+      errorCode: 'twilio_socket_closed'
+    }).catch((alertError) => {
+      logger.error('[alerting] Failed to send Twilio close alert.', { callSid, streamSid, error: alertError.message });
+    });
     finalizeCall('twilio_close');
     if (openAiSocket && openAiSocket.readyState === WebSocket.OPEN) {
       openAiSocket.close();
@@ -572,6 +629,15 @@ wsServer.on('connection', (twilioSocket, req) => {
 
   twilioSocket.on('error', (error) => {
     logger.error('[stream] Twilio socket error.', { callSid, streamSid, error: error.message });
+    alertCritical(ALERT_EVENT_TYPES.TWILIO_STREAM_FAILURE, {
+      callSid,
+      streamSid,
+      source: 'server.twilioSocket.error',
+      message: error.message,
+      errorCode: error.code || 'twilio_socket_error'
+    }).catch((alertError) => {
+      logger.error('[alerting] Failed to send Twilio error alert.', { callSid, streamSid, error: alertError.message });
+    });
     closeBoth('twilio_error');
   });
 });
