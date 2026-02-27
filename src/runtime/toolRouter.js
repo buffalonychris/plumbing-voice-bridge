@@ -4,6 +4,8 @@ const { assertState, canTransition, transition } = require('./stateMachine');
 const { hasRequiredFieldsForTransition } = require('./requiredFields');
 const hubspotClient = require('../integrations/hubspotClient');
 const calendarClient = require('../integrations/calendarClient');
+const twilioSms = require('../integrations/twilioSms');
+const { buildIdempotencyKey, withIdempotency } = require('../governance/withIdempotency');
 
 const ALLOWED_TOOLS = Object.freeze([
   'capture_identity',
@@ -63,6 +65,7 @@ function validateString(payload, key, { optional = false } = {}) {
 
 
 const LOCKED_ESTIMATE_SCHEDULED_STAGE_ID = '3233958615';
+const LOCKED_SMS_SENT_STAGE_ID = '3233958613';
 
 function hasCrmSchedulingContext(session) {
   return session?.hubspot?.crmReady === true
@@ -76,6 +79,68 @@ function assertSchedulingPreconditions(session) {
       code: 'missing_prerequisites'
     });
   }
+}
+
+function assertCrmReadyOrThrow(session) {
+  if (session?.hubspot?.crmReady !== true) {
+    throw Object.assign(new Error('CRM is not ready for this operation'), {
+      code: 'crm_not_ready'
+    });
+  }
+}
+
+function coerceHubspotBoolean(value) {
+  if (value === true || value === 'true' || value === 'TRUE') {
+    return true;
+  }
+  if (value === false || value === 'false' || value === 'FALSE') {
+    return false;
+  }
+  return null;
+}
+
+function formatBookingLabel(startISO, timeZone) {
+  const date = new Date(startISO);
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true
+  }).format(date);
+}
+
+function shortErrorMessage(error) {
+  return String(error?.message || 'unknown').replace(/\s+/g, ' ').slice(0, 140);
+}
+
+async function readConsentState(session) {
+  const sessionConsent = session?.contactConsent;
+  if (sessionConsent && typeof sessionConsent.consent === 'boolean') {
+    return {
+      consent: sessionConsent.consent,
+      consentTsISO: sessionConsent.consentTsISO || null,
+      source: 'session'
+    };
+  }
+
+  const contactId = session?.hubspot?.contactId;
+  if (!contactId) {
+    return { consent: null, consentTsISO: null, source: 'none' };
+  }
+
+  const contact = await hubspotClient.getContactById(contactId);
+  const consent = coerceHubspotBoolean(contact?.properties?.sms_customer_consent);
+  const consentTsISO = contact?.properties?.sms_customer_consent_ts || null;
+
+  return {
+    consent,
+    consentTsISO,
+    source: 'hubspot',
+    phone: contact?.properties?.phone || null
+  };
 }
 
 function findSelectedSlot(payload, proposedSlots) {
@@ -350,6 +415,133 @@ async function handleBookEstimate({ callSid, session, payload }) {
   }
 }
 
+async function handleRequestSmsConsent({ callSid, session, payload }) {
+  assertAllowedState(session, ['BOOKED']);
+
+  if (typeof payload.consent !== 'boolean') {
+    throw Object.assign(new Error('request_sms_consent requires boolean consent'), {
+      code: 'invalid_payload',
+      details: { field: 'consent' }
+    });
+  }
+
+  assertCrmReadyOrThrow(session);
+
+  if (payload.consent === true) {
+    const consentTsISO = new Date().toISOString();
+    await hubspotClient.updateContactConsent({
+      contactId: session.hubspot.contactId,
+      consent: true,
+      consentTsISO,
+      callSid
+    });
+
+    session.contactConsent = {
+      consent: true,
+      consentTsISO
+    };
+
+    return success('request_sms_consent', session, { consent: true, consentTsISO });
+  }
+
+  session.contactConsent = {
+    consent: false,
+    consentTsISO: null
+  };
+
+  await maybeLogEngagement(callSid, session, 'Customer declined SMS consent.');
+
+  return success('request_sms_consent', session, { consent: false, consentTsISO: null });
+}
+
+async function handleSendConfirmationSms({ callSid, session }) {
+  assertAllowedState(session, ['BOOKED']);
+  assertCrmReadyOrThrow(session);
+
+  const { contactId, dealId } = session.hubspot || {};
+  if (!contactId || !dealId) {
+    throw Object.assign(new Error('HubSpot IDs missing'), {
+      code: 'missing_hubspot_ids',
+      details: { contactId: Boolean(contactId), dealId: Boolean(dealId) }
+    });
+  }
+
+  const booking = session.booking;
+  if (!booking?.startISO || !booking?.endISO) {
+    throw Object.assign(new Error('Booking with start/end is required before confirmation SMS'), {
+      code: 'missing_prerequisites',
+      details: { field: 'booking.startISO|booking.endISO' }
+    });
+  }
+
+  let consentState = await readConsentState(session);
+  if (consentState.source === 'session') {
+    consentState = await readConsentState({ hubspot: { contactId } });
+  }
+
+  if (consentState.consent !== true) {
+    return buildError('send_confirmation_sms', 'sms_consent_required', 'SMS consent is required before sending confirmation SMS');
+  }
+
+  if (!consentState.consentTsISO) {
+    return buildError('send_confirmation_sms', 'sms_consent_ts_missing', 'SMS consent timestamp is required before sending confirmation SMS');
+  }
+
+  const contactPhone = session?.contact?.phone || consentState.phone;
+  if (!contactPhone) {
+    throw Object.assign(new Error('Contact phone is required for confirmation SMS'), {
+      code: 'missing_prerequisites',
+      details: { field: 'contact.phone' }
+    });
+  }
+
+  const timeZone = process.env.BUSINESS_TIMEZONE || 'America/New_York';
+  const localDateTimeLabel = formatBookingLabel(booking.startISO, timeZone);
+  const body = `Your estimate is scheduled for ${localDateTimeLabel} (${timeZone}). Reply YES to confirm or call us if you need to reschedule.`;
+
+  const idempotencyKey = buildIdempotencyKey({
+    tenant: 'single',
+    callSid,
+    operation: 'twilio_send_sms',
+    inputs: {
+      to: contactPhone,
+      bodyTemplateIdOrBody: body,
+      dealId
+    }
+  });
+
+  try {
+    twilioSms.assertTwilioSmsConfigured();
+    const smsResult = await withIdempotency({
+      key: idempotencyKey,
+      loggerContext: { callSid, operation: 'twilio_send_sms' },
+      fn: async () => twilioSms.sendSms({ to: contactPhone, body })
+    });
+
+    assertRequiredForTransition({ ...session, contactConsent: { consent: true, consentTsISO: consentState.consentTsISO } }, 'CONFIRMED_SMS_SENT');
+    assertTransitionAllowed(session, 'CONFIRMED_SMS_SENT');
+    transition(session, 'CONFIRMED_SMS_SENT', 'tool:send_confirmation_sms');
+
+    await hubspotClient.updateDealStage({
+      dealId,
+      pipelineId: hubspotClient.LOCKED_PIPELINE_ID,
+      dealstage: LOCKED_SMS_SENT_STAGE_ID,
+      callSid
+    });
+
+    await maybeLogEngagement(callSid, session, `SMS sent (${smsResult.messageSid}) for booked time ${localDateTimeLabel}.`);
+
+    return success('send_confirmation_sms', session, {
+      messageSid: smsResult.messageSid,
+      to: contactPhone,
+      bodyPreview: body.slice(0, 120)
+    });
+  } catch (error) {
+    await maybeLogEngagement(callSid, session, `SMS send failed: ${shortErrorMessage(error)}`);
+    return buildError('send_confirmation_sms', 'sms_send_failed', 'Failed to send confirmation SMS', { message: error.message });
+  }
+}
+
 async function handleFinalizeAndLog({ callSid, session }) {
   assertAllowedState(session, ['PROBLEM_CAPTURED', 'SCHEDULING', 'BOOKED', 'CONFIRMED_SMS_SENT', 'ESCALATED']);
 
@@ -387,6 +579,8 @@ const handlers = {
   begin_scheduling: handleBeginScheduling,
   propose_slots: handleProposeSlots,
   book_estimate: handleBookEstimate,
+  request_sms_consent: handleRequestSmsConsent,
+  send_confirmation_sms: handleSendConfirmationSms,
   finalize_and_log: handleFinalizeAndLog
 };
 

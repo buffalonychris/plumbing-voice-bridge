@@ -15,6 +15,9 @@ const REQUIRED_FIELDS_BY_TRANSITION = Object.freeze({
   },
   PROBLEM_CAPTURED: {
     SCHEDULING: ['hubspot.crmReady', 'hubspot.contactId', 'hubspot.dealId', 'problem.problem_summary']
+  },
+  BOOKED: {
+    CONFIRMED_SMS_SENT: ['booking.startISO', 'booking.endISO', 'contactConsent.consent', 'contactConsent.consentTsISO']
   }
 });
 
