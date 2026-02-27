@@ -7,6 +7,7 @@ const calendarClient = require('../integrations/calendarClient');
 const twilioSms = require('../integrations/twilioSms');
 const { buildIdempotencyKey, withIdempotency } = require('../governance/withIdempotency');
 const { assertDeploymentAllowed, GATED_TOOLS } = require('../governance/deploymentGate');
+const { alertCritical, ALERT_EVENT_TYPES } = require('../monitoring/alerting');
 
 const ALLOWED_TOOLS = Object.freeze([
   'capture_identity',
@@ -403,6 +404,14 @@ async function handleBookEstimate({ callSid, session, payload }) {
       message: error.message
     });
 
+    await alertCritical(ALERT_EVENT_TYPES.CALENDAR_BOOKING_FAILURE, {
+      callSid,
+      streamSid: session.streamSid,
+      source: 'toolRouter.handleBookEstimate',
+      message: error.message,
+      errorCode: error.code || 'calendar_booking_failed'
+    });
+
     if (session?.hubspot?.crmReady === true && session?.hubspot?.dealId && session?.hubspot?.contactId) {
       await hubspotClient.logEngagement(session.hubspot.dealId, session.hubspot.contactId, {
         callSid,
@@ -539,6 +548,13 @@ async function handleSendConfirmationSms({ callSid, session }) {
     });
   } catch (error) {
     await maybeLogEngagement(callSid, session, `SMS send failed: ${shortErrorMessage(error)}`);
+    await alertCritical(ALERT_EVENT_TYPES.TWILIO_STREAM_FAILURE, {
+      callSid,
+      streamSid: session.streamSid,
+      source: 'toolRouter.handleSendConfirmationSms',
+      message: error.message,
+      errorCode: error.code || 'sms_send_failed'
+    });
     return buildError('send_confirmation_sms', 'sms_send_failed', 'Failed to send confirmation SMS', { message: error.message });
   }
 }
@@ -657,6 +673,28 @@ async function dispatchTool({ callSid, toolName, payload }) {
       payload: payload || {}
     });
   } catch (error) {
+    const alertEventTypeByTool = {
+      book_estimate: ALERT_EVENT_TYPES.CALENDAR_BOOKING_FAILURE,
+      send_confirmation_sms: ALERT_EVENT_TYPES.TWILIO_STREAM_FAILURE,
+      capture_identity: ALERT_EVENT_TYPES.HUBSPOT_WRITE_FAILURE,
+      confirm_address: ALERT_EVENT_TYPES.HUBSPOT_WRITE_FAILURE,
+      capture_problem: ALERT_EVENT_TYPES.HUBSPOT_WRITE_FAILURE,
+      request_sms_consent: ALERT_EVENT_TYPES.HUBSPOT_WRITE_FAILURE,
+      finalize_and_log: ALERT_EVENT_TYPES.HUBSPOT_WRITE_FAILURE
+    };
+
+    const alertEventType = alertEventTypeByTool[toolName];
+    if (alertEventType) {
+      await alertCritical(alertEventType, {
+        callSid,
+        streamSid: sessionStore.getSession(callSid)?.streamSid || 'unknown-stream',
+        source: 'toolRouter.dispatchTool',
+        message: error.message,
+        errorCode: error.code || 'tool_error',
+        toolName
+      });
+    }
+
     return buildError(toolName, error.code || 'tool_error', error.message, error.details);
   }
 }

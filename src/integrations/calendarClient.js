@@ -1,4 +1,5 @@
 const { buildIdempotencyKey, withIdempotency } = require('../governance/withIdempotency');
+const { alertCritical, ALERT_EVENT_TYPES } = require('../monitoring/alerting');
 
 const GOOGLE_API_BASE_URL = 'https://www.googleapis.com/calendar/v3';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -37,19 +38,45 @@ async function getGoogleAccessToken() {
     grant_type: 'refresh_token'
   });
 
-  const response = await fetch(GOOGLE_TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body
-  });
+  let response;
+  try {
+    response = await fetch(GOOGLE_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    });
+  } catch (error) {
+    await alertCritical(ALERT_EVENT_TYPES.OAUTH_REFRESH_FAILURE, {
+      callSid: 'calendar-oauth-refresh',
+      source: 'calendarClient.getGoogleAccessToken',
+      message: error.message,
+      errorCode: error.code || 'oauth_refresh_network_error'
+    });
+    throw error;
+  }
 
   if (!response.ok) {
     const raw = await response.text();
+    await alertCritical(ALERT_EVENT_TYPES.OAUTH_REFRESH_FAILURE, {
+      callSid: 'calendar-oauth-refresh',
+      source: 'calendarClient.getGoogleAccessToken',
+      message: `Google OAuth token request failed (${response.status})`,
+      status: response.status,
+      errorCode: 'oauth_refresh_failed',
+      raw
+    });
     throw new Error(`Google OAuth token request failed (${response.status}): ${raw}`);
   }
 
   const json = await response.json();
   if (!json.access_token) {
+    await alertCritical(ALERT_EVENT_TYPES.OAUTH_REFRESH_FAILURE, {
+      callSid: 'calendar-oauth-refresh',
+      source: 'calendarClient.getGoogleAccessToken',
+      message: 'Google OAuth token response missing access_token',
+      errorCode: 'oauth_refresh_missing_token',
+      responseKeys: Object.keys(json || {})
+    });
     throw new Error('Google OAuth token response missing access_token');
   }
 
