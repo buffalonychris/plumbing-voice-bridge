@@ -1,4 +1,4 @@
-const { filterContactProps, filterDealProps } = require('../governance/propertyAllowlist');
+const { filterCompanyProps, filterContactProps, filterDealProps } = require('../governance/propertyAllowlist');
 const { buildIdempotencyKey, withIdempotency } = require('../governance/withIdempotency');
 
 const HUBSPOT_BASE_URL = 'https://api.hubapi.com';
@@ -51,6 +51,61 @@ async function hubspotRequest(path, options = {}) {
   }
 
   return response.json();
+}
+
+async function getCompanyById(companyId) {
+  if (!companyId) {
+    throw buildError({
+      message: 'Company lookup requires companyId',
+      code: 'missing_company_id'
+    });
+  }
+
+  const result = await hubspotRequest(`/crm/v3/objects/companies/${companyId}?properties=deployment_status`);
+  return {
+    id: result.id,
+    properties: result.properties || {}
+  };
+}
+
+async function updateCompanyDeploymentStatus({ companyId, deployment_status, callSid, reason }) {
+  if (!companyId) {
+    throw buildError({
+      message: 'Company update requires companyId',
+      code: 'missing_company_id'
+    });
+  }
+
+  const payload = filterCompanyProps({ deployment_status });
+
+  const key = buildIdempotencyKey({
+    tenant: 'single',
+    callSid,
+    operation: 'hubspot_update_company_deployment_status',
+    inputs: {
+      companyId,
+      deployment_status,
+      reason
+    }
+  });
+
+  return withIdempotency({
+    key,
+    loggerContext: { callSid, operation: 'hubspot_update_company_deployment_status' },
+    fn: async () => {
+      await hubspotRequest(`/crm/v3/objects/companies/${companyId}`, {
+        method: 'PATCH',
+        body: payload
+      });
+
+      return {
+        ok: true,
+        companyId,
+        deployment_status,
+        reason: reason || null
+      };
+    }
+  });
 }
 
 async function findContactByPhone(phoneE164) {
@@ -351,6 +406,8 @@ async function updateContactConsent({ contactId, consent, consentTsISO, callSid 
   });
 }
 module.exports = {
+  getCompanyById,
+  updateCompanyDeploymentStatus,
   findContactByPhone,
   getContactById,
   upsertContact,
