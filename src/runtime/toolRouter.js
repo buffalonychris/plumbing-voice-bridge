@@ -6,6 +6,7 @@ const hubspotClient = require('../integrations/hubspotClient');
 const calendarClient = require('../integrations/calendarClient');
 const twilioSms = require('../integrations/twilioSms');
 const { buildIdempotencyKey, withIdempotency } = require('../governance/withIdempotency');
+const { assertDeploymentAllowed, GATED_TOOLS } = require('../governance/deploymentGate');
 
 const ALLOWED_TOOLS = Object.freeze([
   'capture_identity',
@@ -584,6 +585,41 @@ const handlers = {
   finalize_and_log: handleFinalizeAndLog
 };
 
+function isHubspotEnabled() {
+  return String(process.env.HUBSPOT_ENABLED || '').trim().toLowerCase() === 'true';
+}
+
+async function enforceDeploymentGate({ callSid, toolName, session }) {
+  if (!GATED_TOOLS.includes(toolName)) {
+    return null;
+  }
+
+  if (!isHubspotEnabled() || session?.hubspot?.crmReady !== true) {
+    return buildError(toolName, 'crm_not_ready', 'CRM is not ready for this operation');
+  }
+
+  const companyId = process.env.HUBSPOT_COMPANY_ID;
+  const company = await hubspotClient.getCompanyById(companyId);
+  const deploymentStatus = company?.properties?.deployment_status || null;
+  const callerPhoneE164 = session?.callerPhoneE164 || session?.contact?.phone || session?.callerPhone;
+  const gate = assertDeploymentAllowed({
+    session,
+    toolName,
+    callerPhoneE164,
+    deploymentStatus
+  });
+
+  if (gate.allowed) {
+    return null;
+  }
+
+  return buildError(toolName, gate.code || 'deployment_unknown', 'Deployment status does not allow this tool', {
+    deployment_status: deploymentStatus,
+    reason: gate.reason
+  });
+}
+
+
 async function dispatchTool({ callSid, toolName, payload }) {
   try {
     sessionStore.touchSession(callSid);
@@ -608,6 +644,11 @@ async function dispatchTool({ callSid, toolName, payload }) {
     const handler = handlers[toolName];
     if (!handler) {
       return buildError(toolName, 'not_implemented', 'Tool handler not implemented');
+    }
+
+    const deploymentGateError = await enforceDeploymentGate({ callSid, toolName, session });
+    if (deploymentGateError) {
+      return deploymentGateError;
     }
 
     return await handler({

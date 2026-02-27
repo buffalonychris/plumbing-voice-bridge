@@ -270,3 +270,70 @@ Manual test:
 ## Proxy behavior compatibility
 
 `POST /twilio/voice` response shape and the Twilio ↔ OpenAI relay flow remain unchanged. The new state/session modules only add lifecycle bookkeeping and structured transition/session logs.
+
+## Deployment gating and Stripe webhook (PR7)
+
+### Required env for deployment gating
+
+Set these when using HubSpot gating:
+
+```bash
+export HUBSPOT_ENABLED=true
+export HUBSPOT_ACCESS_TOKEN=...
+export HUBSPOT_COMPANY_ID=304267668200
+export TEST_CALLER_ALLOWLIST="+17162508937,+17165471378"
+```
+
+`HUBSPOT_COMPANY_ID` is required when `HUBSPOT_ENABLED=true`.
+
+### Deployment status semantics (HubSpot Company `deployment_status` internal name)
+
+- `live` → **open** (gated tools allowed for everyone)
+- `not_deployed`, `provisioning`, `awaiting_forwarding` → **test_only** (only allowlisted testers)
+- `suspended`, `cancelled` → **blocked** (denied for everyone)
+- any unknown/empty value → denied (`deployment_unknown`)
+
+Gated tools:
+
+- `begin_scheduling`
+- `propose_slots`
+- `book_estimate`
+- `request_sms_consent`
+- `send_confirmation_sms`
+
+### Stripe webhook-driven deployment status updates
+
+```bash
+export STRIPE_ENABLED=true
+export STRIPE_WEBHOOK_SECRET=whsec_...
+export STRIPE_WEBHOOK_TOLERANCE_SECONDS=300
+```
+
+Endpoint: `POST /stripe/webhook`
+
+Webhook mappings:
+
+- `checkout.session.completed` → `deployment_status=live`
+- `invoice.paid` → `deployment_status=live`
+- `invoice.payment_failed` → `deployment_status=suspended`
+- `customer.subscription.deleted` → `deployment_status=cancelled`
+
+All Stripe-triggered HubSpot Company updates are idempotent.
+
+### PR7 gating smoke test
+
+Run a local smoke check for allowlist and tool routing behavior:
+
+```bash
+node scripts/smoke_pr7_gating.js
+```
+
+To validate via internal tooling endpoint:
+
+```bash
+export INTERNAL_TOOLING_ENABLED=true
+# Use a sample callSid session created by stream start/internal flow, then call a gated tool.
+curl -s -X POST http://localhost:8080/internal/tools/CA123 \
+  -H 'Content-Type: application/json' \
+  -d '{"toolName":"begin_scheduling","payload":{}}'
+```

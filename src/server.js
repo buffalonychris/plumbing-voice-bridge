@@ -2,7 +2,8 @@ const fs = require('fs');
 const http = require('http');
 const express = require('express');
 const WebSocket = require('ws');
-const { validateEnv, validateHubspotEnv, isHubspotEnabled } = require('./config/env');
+const crypto = require('crypto');
+const { validateEnv, validateHubspotEnv, validateStripeEnv, isHubspotEnabled } = require('./config/env');
 const {
   DEFAULT_PORT,
   DEFAULT_OPENAI_REALTIME_MODEL,
@@ -25,15 +26,18 @@ const {
   upsertContact,
   createDeal,
   associateDealToContact,
-  logEngagement
+  logEngagement,
+  getCompanyById,
+  updateCompanyDeploymentStatus
 } = require('./integrations/hubspotClient');
 const { dispatchTool } = require('./runtime/toolRouter');
 require('dotenv').config();
 
 try {
   validateHubspotEnv();
+  validateStripeEnv();
 } catch (envError) {
-  logger.error('[startup] HubSpot configuration invalid.', { error: envError.message });
+  logger.error('[startup] Configuration invalid.', { error: envError.message });
   process.exit(1);
 }
 
@@ -43,6 +47,18 @@ const OPENAI_VOICE = process.env.OPENAI_VOICE || DEFAULT_OPENAI_VOICE;
 const OPERATOR_COMPANY_NAME = process.env.OPERATOR_COMPANY_NAME || DEFAULT_OPERATOR_COMPANY_NAME;
 const IDP_ENABLED = String(process.env.IDP_ENABLED || 'true').trim().toLowerCase() === 'true';
 const IDP_DB_PATH = process.env.IDP_DB_PATH || './.data/idempotency.sqlite';
+const STRIPE_ENABLED = String(process.env.STRIPE_ENABLED || 'false').trim().toLowerCase() === 'true';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const STRIPE_WEBHOOK_TOLERANCE_SECONDS = Number(process.env.STRIPE_WEBHOOK_TOLERANCE_SECONDS || 300);
+let stripe = null;
+if (STRIPE_ENABLED) {
+  try {
+    const Stripe = require('stripe');
+    stripe = new Stripe(process.env.STRIPE_API_KEY || 'sk_local_unused', { apiVersion: '2024-06-20' });
+  } catch (_error) {
+    stripe = null;
+  }
+}
 
 function loadSystemPrompt() {
   if (process.env.OPERATOR_SYSTEM_PROMPT && process.env.OPERATOR_SYSTEM_PROMPT.trim()) {
@@ -60,6 +76,94 @@ function loadSystemPrompt() {
 const SYSTEM_PROMPT = loadSystemPrompt();
 
 const app = express();
+
+function parseStripeSignature(signatureHeader) {
+  const parts = String(signatureHeader || '').split(',');
+  const parsed = {};
+
+  for (const part of parts) {
+    const [k, v] = part.split('=');
+    if (k && v) {
+      parsed[k.trim()] = v.trim();
+    }
+  }
+
+  return {
+    timestamp: parsed.t,
+    signature: parsed.v1
+  };
+}
+
+function verifyStripeWebhookSignature(rawBodyBuffer, signatureHeader, secret, toleranceSeconds) {
+  const { timestamp, signature } = parseStripeSignature(signatureHeader);
+  if (!timestamp || !signature) {
+    throw new Error('Invalid Stripe signature header');
+  }
+
+  const signedPayload = `${timestamp}.${rawBodyBuffer.toString('utf8')}`;
+  const expectedSignature = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');
+
+  const expectedBuffer = Buffer.from(expectedSignature, 'hex');
+  const providedBuffer = Buffer.from(signature, 'hex');
+
+  if (expectedBuffer.length !== providedBuffer.length || !crypto.timingSafeEqual(expectedBuffer, providedBuffer)) {
+    throw new Error('Stripe signature mismatch');
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const age = Math.abs(nowSeconds - Number(timestamp));
+  if (Number.isFinite(toleranceSeconds) && age > toleranceSeconds) {
+    throw new Error('Stripe signature timestamp outside tolerance');
+  }
+}
+
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!STRIPE_ENABLED) {
+    return res.status(404).json({ ok: false });
+  }
+
+  try {
+    const signature = req.headers['stripe-signature'];
+    let event;
+
+    if (stripe) {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        STRIPE_WEBHOOK_SECRET,
+        Number.isFinite(STRIPE_WEBHOOK_TOLERANCE_SECONDS) ? STRIPE_WEBHOOK_TOLERANCE_SECONDS : 300
+      );
+    } else {
+      verifyStripeWebhookSignature(req.body, signature, STRIPE_WEBHOOK_SECRET, Number.isFinite(STRIPE_WEBHOOK_TOLERANCE_SECONDS) ? STRIPE_WEBHOOK_TOLERANCE_SECONDS : 300);
+      event = JSON.parse(req.body.toString('utf8'));
+    }
+
+    const companyId = process.env.HUBSPOT_COMPANY_ID;
+    const callSid = `stripe-${event.id || 'unknown'}`;
+
+    if (event.type === 'checkout.session.completed') {
+      await updateCompanyDeploymentStatus({ companyId, deployment_status: 'live', callSid, reason: 'stripe_checkout_completed' });
+    }
+
+    if (event.type === 'invoice.paid') {
+      await updateCompanyDeploymentStatus({ companyId, deployment_status: 'live', callSid, reason: 'stripe_invoice_paid' });
+    }
+
+    if (event.type === 'invoice.payment_failed') {
+      await updateCompanyDeploymentStatus({ companyId, deployment_status: 'suspended', callSid, reason: 'stripe_invoice_payment_failed' });
+    }
+
+    if (event.type === 'customer.subscription.deleted') {
+      await updateCompanyDeploymentStatus({ companyId, deployment_status: 'cancelled', callSid, reason: 'stripe_subscription_deleted' });
+    }
+
+    return res.status(200).json({ received: true });
+  } catch (error) {
+    logger.error('[stripe] Webhook handling failed.', { message: error.message });
+    return res.status(400).json({ ok: false });
+  }
+});
+
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
@@ -144,6 +248,28 @@ async function initializeIdempotency() {
   const result = await initIdempotency(IDP_DB_PATH);
   logger.info('[startup] Idempotency store initialized.', { dbPath: result.dbPath });
 }
+
+async function logStartupDeploymentStatus() {
+  if (!isHubspotEnabled()) {
+    return;
+  }
+
+  try {
+    const companyId = process.env.HUBSPOT_COMPANY_ID;
+    const company = await getCompanyById(companyId);
+    logger.info('[startup] HubSpot deployment status fetched.', {
+      companyId,
+      deployment_status: company?.properties?.deployment_status || null
+    });
+  } catch (error) {
+    logger.error('[startup] Failed to fetch HubSpot deployment status.', {
+      message: error.message,
+      code: error.code,
+      status: error.status
+    });
+  }
+}
+
 
 async function runHubspotIntake({ callSid, streamSid, callerPhone }) {
   if (!isHubspotEnabled()) {
@@ -483,6 +609,7 @@ async function bootstrap() {
   }
 
   startSessionJanitor();
+  await logStartupDeploymentStatus();
 
   server.listen(PORT, '0.0.0.0', () => {
     logger.info(`[startup] plumbing-voice-bridge listening on 0.0.0.0:${PORT}`);
